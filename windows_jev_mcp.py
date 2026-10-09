@@ -86,7 +86,7 @@ def _show(app: str) -> dict:
     page.parent.mkdir(parents=True, exist_ok=True)
     page.write_text(lib.html(), encoding="utf-8")
     os.startfile(page)
-    return {"app": lib.app, "page": str(page), "routes": len(lib.reveals), "groundings": len(lib.grounding)}
+    return {"app": lib.app, "page": str(page), "routes": len(lib.reveals)}
 
 
 def _edit(app: str, control: str, add: list[str] | None, remove: list[str] | None, delete: bool) -> dict:
@@ -101,8 +101,7 @@ def show_graph(app: str) -> dict:
     """Open the app's saved link tree as an HTML page in the browser.
 
     `app` is an app name ("olk", "calculator") or part of an open window's title.
-    Each control expands into the controls clicking it reveals; the page has a filter
-    box and lists the learned groundings.
+    Each control expands into the controls clicking it reveals; the page has a filter box.
     """
     return _call(_show, app)
 
@@ -128,8 +127,7 @@ def run_steps(window: str, steps: list[str]) -> dict:
     needs to be named. Runs follow new windows the app opens and wait up to 3 s for
     known controls while a window opens. Every click grows the graph.
 
-    Grounding is exact name, then a learned grounding, then the graph, then one
-    batched Jev call. Stops at the first step with no matching control; clicks that
+    Grounding is exact name, then the graph, then one batched Jev call. Stops at the first step with no matching control; clicks that
     changed nothing are flagged screen_changed=false. Returns per-step timings in ms
     (with the route walked) and the final screen_text for verification.
     """

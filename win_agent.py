@@ -564,24 +564,25 @@ def _norm(text: str) -> str:
     return " ".join(text.lower().split())
 
 
-class Library:
-    """One app's navigation graph and learned groundings, persisted as JSON between runs.
+def lookup(target: str, action: str, offered: list[dict]) -> dict | None:
+    """The one visible control named exactly like the step, if there is exactly one."""
+    wanted = _norm(target)
+    exact = [c for c in offered if c["action"] == action and _norm(c["text"]) == wanted]
+    return exact[0] if len(exact) == 1 else None
 
-    reveals:   control name -> control names that appeared after clicking it (tab, menu,
-               dialog, new window). Routes are chains of these from what is visible now.
-    grounding: "click|new email" -> control name, learned from steps that worked.
+
+class Library:
+    """One app's navigation graph, persisted as JSON between runs.
+
+    reveals: control name -> control names that appeared after clicking it (tab, menu,
+             dialog, new window). Routes are chains of these from what is visible now.
     """
 
     def __init__(self, app: str, root: Path = LIBRARY):
         self.path = root / f"{re.sub(r'[^a-z0-9_.-]+', '_', app)}.json"
         data = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
         self.app = app
-        self.grounding: dict[str, str] = data.get("grounding", {})
         self.reveals: dict[str, list[str]] = data.get("reveals", {})
-
-    @staticmethod
-    def _key(target: str, action: str) -> str:
-        return f"{action}|{_norm(target)}"
 
     def record(self, control: str, before: set[str], after: set[str]) -> None:
         if _RISKY.search(control):  # Send, Delete...: what follows is a new state, not a menu
@@ -637,7 +638,7 @@ class Library:
             self.reveals.pop(control, None)
 
     def html(self) -> str:
-        """Standalone page: every route as a collapsible tree, plus the learned groundings."""
+        """Standalone page: every route as a collapsible tree with a filter box."""
         import html as h
 
         revealed = {n for names in self.reveals.values() for n in names}
@@ -658,23 +659,16 @@ class Library:
         trees = "".join(branch(c, frozenset()) for c in roots)
         # Controls only reachable through loops have no root; show them at top level too.
         trees += "".join(branch(c, frozenset()) for c in sorted(self.reveals) if c not in placed)
-        rows = "".join(
-            f"<tr><td>{h.escape(k.split('|', 1)[0])}</td><td>{h.escape(k.split('|', 1)[1])}</td><td>{h.escape(v)}</td></tr>"
-            for k, v in sorted(self.grounding.items())
-        )
         return f"""<!doctype html><meta charset="utf-8"><title>{h.escape(self.app)} link tree</title>
 <style>
 body{{font:14px system-ui,sans-serif;margin:24px;max-width:1100px}} ul{{list-style:none;padding-left:18px;margin:2px 0}}
 li{{margin:1px 0}} summary{{cursor:pointer}} small{{color:#777}} .hit{{background:#ffe066}}
-input{{font-size:14px;padding:6px;width:320px}} table{{border-collapse:collapse;margin-top:8px}}
-td,th{{border:1px solid #ddd;padding:3px 8px;text-align:left}}
+input{{font-size:14px;padding:6px;width:320px}}
 </style>
 <h1>{h.escape(self.app)}</h1>
 <p>{len(self.reveals)} controls with routes, {len(revealed)} controls reachable through them. Source: <code>{h.escape(str(self.path))}</code></p>
 <p><input id="q" placeholder="Filter controls..." autofocus> <button onclick="all(true)">Expand all</button> <button onclick="all(false)">Collapse all</button></p>
 <ul id="tree">{trees}</ul>
-<h2>Learned groundings</h2>
-<table><tr><th>Action</th><th>Step text</th><th>Control</th></tr>{rows}</table>
 <script>
 const all = open => document.querySelectorAll('details').forEach(d => d.open = open);
 document.getElementById('q').oninput = e => {{
@@ -688,26 +682,14 @@ document.getElementById('q').oninput = e => {{
 }};
 </script>"""
 
-    def lookup(self, target: str, action: str, offered: list[dict]) -> dict | None:
-        """A visible control for this step without asking Jev: exact name, else a learned one."""
+    def knows(self, target: str) -> bool:
+        """The graph has seen this control, so it can appear once a window finishes opening."""
         wanted = _norm(target)
-        exact = [c for c in offered if c["action"] == action and c["text"].lower() == wanted]
-        if len(exact) == 1:
-            return exact[0]
-        learned = self.grounding.get(self._key(target, action))
-        return next((c for c in offered if c["action"] == action and c["text"] == learned), None)
-
-    def knows(self, target: str, action: str) -> bool:
-        return self._key(target, action) in self.grounding
-
-    def learn(self, target: str, action: str, name: str) -> None:
-        # ponytail: a wrong Jev grounding that still changed the screen is kept; edit or
-        # delete the app's JSON file to correct it.
-        self.grounding[self._key(target, action)] = name
+        return any(_norm(n) == wanted for c, names in self.reveals.items() for n in [c, *names])
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        data = {"app": self.app, "reveals": self.reveals, "grounding": self.grounding}
+        data = {"app": self.app, "reveals": self.reveals}
         temp = self.path.with_suffix(".tmp")
         temp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         os.replace(temp, self.path)
@@ -906,11 +888,10 @@ class Session:
     def run_plan(self, steps: list[str]) -> dict:
         """Execute caller-planned steps; each step is grounded to a control as cheaply as possible.
 
-        Order: exact control name on screen, then a learned grounding, then a walk along the
-        app graph to a screen that shows the control, then Jev. Jev grounds all remaining
-        unknown steps in one request and its answers are reused while the set of clickable
-        controls stays the same. A step the library knows but cannot see yet (a window still
-        opening) is waited for up to 3 s.
+        Order: exact control name on screen, then a walk along the app graph to a screen that
+        shows the control, then Jev. Jev grounds all remaining unknown steps in one request and
+        its answers are reused while the set of clickable controls stays the same. A control the
+        graph has seen but cannot reach from here (a window still opening) is waited for up to 3 s.
         """
         plan = [parse_step(step) for step in steps]
         focus(self.hwnd)
@@ -921,14 +902,14 @@ class Session:
             t_step = time.perf_counter()
             action = "click" if text is None else "type"
             rect, candidates, shot, timing, offered = self._look()
-            chosen = self.lib.lookup(target, action, offered)
+            chosen = lookup(target, action, offered)
             path = self.lib.path_to(self.names, target) if chosen is None else None
-            if chosen is None and not path and self.lib.knows(target, action):
+            if chosen is None and not path and self.lib.knows(target):
                 while chosen is None and time.perf_counter() - t_step < 3.0:
                     time.sleep(0.05)
                     rect, candidates, shot, timing, offered = self._look()
-                    chosen = self.lib.lookup(target, action, offered)
-            grounded_by, jev_ms, route = "library", 0.0, []
+                    chosen = lookup(target, action, offered)
+            grounded_by, jev_ms, route = "name", 0.0, []
             if chosen is None:
                 for name in path or []:
                     hop = next((c for c in offered if c["action"] == "click" and c["text"] == name), None)
@@ -937,7 +918,7 @@ class Session:
                     self._hop(hop, rect, shot)
                     route.append(name)
                     rect, candidates, shot, timing, offered = self._look()
-                chosen = self.lib.lookup(target, action, offered) if route else None
+                chosen = lookup(target, action, offered) if route else None
                 grounded_by = "graph"
             if chosen is None:
                 grounded_by = "jev"
@@ -967,8 +948,6 @@ class Session:
                 summary = self._finish(f"stopped: no control found for step {self.step} {steps[index]!r}", record, shot, offered, None)
                 return self._with_screen(summary)
             self._act(chosen, rect, shot, offered, record, t_step, text, press_enter)
-            if record["screen_changed"] or text is not None:
-                self.lib.learn(target, action, chosen["text"])
         return self._with_screen(self._finish("done", None, None, None, None))
 
     def _with_screen(self, summary: dict) -> dict:
@@ -1150,9 +1129,7 @@ def _self_check() -> None:
 
     with tempfile.TemporaryDirectory() as root:
         lib = Library("demo app", Path(root))
-        assert lib.lookup("go", "click", offered)["text"] == "Go"
-        assert lib.lookup("Send it", "click", offered) is None and not lib.knows("Send it", "click")
-        lib.learn("Send  it", "click", "Go")
+        assert lookup("go", "click", offered)["text"] == "Go" and lookup("Send it", "click", offered) is None
         home = {"Home", "Insert", "New mail", "Reply"}
         insert = {"Home", "Insert", "Table", "Picture", "Link"}
         lib.record("Insert", home, insert)
@@ -1169,11 +1146,11 @@ def _self_check() -> None:
         assert lib.reachable(home) == {"Link": 1, "Picture": 1, "Table": 1, "Columns": 2, "OK": 2, "Rows": 2}
         lib.save()
         again = Library("demo app", Path(root))
-        assert again.lookup("send it", "click", offered)["text"] == "Go"
         assert again.path_to(home, "Columns") == ["Insert", "Table"]
+        assert again.knows("columns") and again.knows("Insert") and not again.knows("Send it")
         again.edit("Rows", add=["Insert"])  # a loop must not recurse forever
         page = again.html()
-        assert "<b>Insert</b>" in page and "Columns" in page and "(loop)" in page and "send it" in page
+        assert "<b>Insert</b>" in page and "Columns" in page and "(loop)" in page
         again.edit("Insert", remove=["Table"], add=["Chart"])
         assert again.reveals["Insert"] == ["Link", "Picture", "Chart"]
         again.edit("Table", remove=["Rows", "Columns", "OK"])
