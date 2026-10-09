@@ -16,7 +16,7 @@ Measured on Windows Calculator: a 6-click calculation in about 1.1 s end to end,
 | Tool | Use |
 |---|---|
 | `list_windows()` | Titles of visible top-level windows. |
-| `run_steps(window, steps)` | Fastest and most reliable. Each step names a control as it appears on screen (`"Seven"`, `"Add New Tab"`) or is `type "<text>" into <field>` (optionally `... and press enter`). Stops at the first step that finds no control or changes nothing. Returns per-step timings in ms and the window's `screen_text` for verification. |
+| `run_steps(window, steps)` | Fastest and most reliable. Each step names a control as it appears on screen (`"Seven"`, `"Add New Tab"`) or is `type "<text>" into <field>` (optionally `... and press enter`). Stops at the first step that finds no control; clicks that changed nothing are flagged `screen_changed: false`. Returns per-step timings in ms and the window's `screen_text` for verification. |
 | `run_goal(window, goal, max_steps=12)` | Jev picks every step itself. When a field needs text it returns `needs_text`; answer with `provide_text`. Slower and weaker at ordered input such as numbers. |
 | `provide_text(text, press_enter=False)` | Continue a paused `run_goal`. |
 

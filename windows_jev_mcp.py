@@ -53,8 +53,9 @@ def run_steps(window: str, steps: list[str]) -> dict:
     "Add New Tab", "File"), or a typing step: type "<text>" into <field>, with an
     optional trailing "and press enter". Steps whose controls are already visible
     are grounded in a single Jev call. Stops at the first step that finds no
-    control or changes nothing on screen. Returns per-step timings in ms and
-    screen_text (static text and field contents) so you can verify the result.
+    control; a step whose click changed nothing is flagged screen_changed=false.
+    Returns per-step timings in ms and screen_text (static text and field
+    contents) so you can verify the result.
     """
     try:
         return _worker.submit(_plan, window, steps).result()

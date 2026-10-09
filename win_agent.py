@@ -651,9 +651,6 @@ class Session:
                 return self._finish(f"stopped: no control found for step {self.step} {step!r}", record, shot, offered, None)
             _target, text, press_enter = parse_step(step)
             self._act(chosen, rect, shot, offered, record, t_step, text, press_enter)
-            if not record["screen_changed"]:
-                summary = self._finish(f"stopped: step {self.step} {step!r} changed nothing", None, None, None, None)
-                return self._with_screen(summary)
         return self._with_screen(self._finish("done", None, None, None, None))
 
     def _with_screen(self, summary: dict) -> dict:
@@ -695,7 +692,10 @@ class Session:
             "goal": self.goal,
             "total_ms": round((time.perf_counter() - self.started) * 1000, 1),
             "steps": [
-                {k: r.get(k) for k in ("step", "source", "read_ms", "jev_ms", "think_ms", "settle_ms", "action")}
+                {
+                    k: r.get(k)
+                    for k in ("step", "source", "read_ms", "jev_ms", "think_ms", "settle_ms", "screen_changed", "action")
+                }
                 for r in self.records
             ],
         }
