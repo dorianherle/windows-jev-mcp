@@ -170,20 +170,22 @@ def settle(rect: tuple[int, int, int, int], before: Image.Image, timeout: float 
     """Wait until the window changed and then stopped changing."""
     # ponytail: 600 ms with no pixel change counts as a dead click; an app that reacts
     # slower than that gets its control marked dead. Raise the timeout for such apps.
-    small = (max(1, before.width // 4), max(1, before.height // 4))
+    def small(image: Image.Image) -> Image.Image:
+        # A 4x4 box average is 4x cheaper than resize() and a 1 px caret still moves it by ~64.
+        return image.convert("L").reduce(4)
 
     def differs(a: Image.Image, b: Image.Image) -> bool:
         # Any pixel changing counts, so a single updated digit is seen.
         return ImageChops.difference(a, b).point(lambda v: 255 if v > 24 else 0).getbbox() is not None
 
-    first = before.resize(small).convert("L")
+    first = small(before)
     previous = first
     changed = False
     t0 = time.perf_counter()
     still_since = t0
     while time.perf_counter() - t0 < timeout:
         # No sleep: a desktop grab already waits for the next composed frame (~17 ms).
-        now = grab(rect).resize(small).convert("L")
+        now = small(grab(rect))
         t = time.perf_counter()
         changed = changed or differs(first, now)
         if differs(previous, now):
@@ -248,7 +250,13 @@ def uia_candidates(hwnd: int, rect: tuple[int, int, int, int]) -> list[dict]:
             request.AddProperty(prop)
         request.TreeScope = U.TreeScope_Element
         request.AutomationElementMode = U.AutomationElementMode_None
-        condition = client.CreatePropertyCondition(U.UIA_IsControlElementPropertyId, True)
+        # Filtering in the query halves the elements marshalled from busy web apps (Outlook).
+        condition = client.CreateAndConditionFromArray([
+            client.CreatePropertyCondition(U.UIA_IsControlElementPropertyId, True),
+            client.CreatePropertyCondition(U.UIA_IsOffscreenPropertyId, False),
+            client.CreatePropertyCondition(U.UIA_IsEnabledPropertyId, True),
+            client.CreateNotCondition(client.CreatePropertyCondition(U.UIA_NamePropertyId, "")),
+        ])
         _uia = (U, client, request, condition)
     U, client, request, condition = _uia
     found = client.ElementFromHandle(hwnd).FindAllBuildCache(U.TreeScope_Descendants, condition, request)
@@ -1018,10 +1026,11 @@ class Session:
 
     def _write(self, final: Image.Image, summary: dict) -> None:
         self.out.mkdir(parents=True, exist_ok=True)
-        final.save(self.out / "final.png")
+        # Fast PNG compression: the logs are written while the next call may already be running.
+        final.save(self.out / "final.png", compress_level=1)
         for step, shot, offered, chosen in self.frames:
-            shot.save(self.out / f"step{step}_screen.png")
-            draw(shot, offered, chosen).save(self.out / f"step{step}_candidates.png")
+            shot.save(self.out / f"step{step}_screen.png", compress_level=1)
+            draw(shot, offered, chosen).save(self.out / f"step{step}_candidates.png", compress_level=1)
         records = {r["step"]: r for r in self.records}
         for step, _shot, offered, _chosen in self.frames:
             (self.out / f"step{step}.json").write_text(
