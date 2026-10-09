@@ -16,22 +16,23 @@ Measured on Windows Calculator: a 6-click calculation in about 1.1 s end to end,
 | Tool | Use |
 |---|---|
 | `list_windows()` | Titles of visible top-level windows. |
-| `describe(window)` | Start here. Buttons, fields and screen text of the current window, plus the app's saved actions and the controls of other windows of the app seen before. No clicks. |
-| `run_steps(window, steps, params=None, save_as=None)` | Run a whole plan in one call. Each step names a control as it appears on screen (`"Seven"`, `"New mail"`) or is `type "<text>" into <field>` (optionally `... and press enter`); `{placeholders}` are filled from `params`. Follows new windows the app opens. `save_as` stores the steps as a reusable action. Stops at the first step that finds no control; clicks that changed nothing are flagged `screen_changed: false`. Returns per-step timings in ms and the final `screen_text`. |
-| `run_action(window, action, params)` | Replay a saved action, e.g. `send_email(to, subject, body)`, in one call. |
+| `describe(window)` | Start here. Buttons, fields and screen text of the current window, plus `reachable`: controls elsewhere in the app the graph can reach, with the clicks needed. No clicks. |
+| `explore(window, max_clicks=40)` | Grow the app graph by clicking each tab once (ribbon tabs, settings tabs). Never clicks buttons; skips names like Send, Delete, Close. |
+| `run_steps(window, steps)` | Run a whole plan in one call. Each step names a control (`"Seven"`, `"New mail"`, `"Density"`) or is `type "<text>" into <field>` (optionally `... and press enter`). A control that is not on screen but known to the graph is reached by walking the learned route first. Follows new windows the app opens. Stops at the first step that finds no control; clicks that changed nothing are flagged `screen_changed: false`. Returns per-step timings in ms, the route walked, and the final `screen_text`. |
 | `run_goal(window, goal, max_steps=12)` | Jev picks every step itself. When a field needs text it returns `needs_text`; answer with `provide_text`. Slower and weaker at ordered input such as numbers. |
 | `provide_text(text, press_enter=False)` | Continue a paused `run_goal`. |
 
-### Per-app library
+### Per-app graph
 
 Each app gets a JSON file in `WINDOWS_JEV_LIBRARY` (default `~/windows_jev_library`, e.g. `olk.json` for new Outlook):
 
-- `grounding`: step text -> control name, learned from steps that worked. A step is grounded by exact name first,
-  then this cache, and only then by Jev, so repeated tasks need no Jev call.
-- `actions`: saved step lists with placeholders, replayed by `run_action`.
-- `windows`: control names per window title, so the caller can plan screens that are not open yet.
+- `reveals`: control -> controls that appeared after clicking it (tab, menu, dialog, new window). Learned from every
+  click in every run and from `explore`. A step whose control is not visible is reached through the shortest chain
+  of these, e.g. `"Density"` in Outlook clicks `View` first.
+- `grounding`: step text -> control name, learned from steps that worked.
 
-The library only learns from reading windows and from successful runs. It never explores by clicking, because
+A step is grounded by exact name, then `grounding`, then a graph route, and only then by Jev, so a known app needs
+no Jev call. A click counts as navigation only when at least 3 controls appear. `explore` clicks only tabs, because
 clicking unknown buttons in apps like Outlook can send, delete or move data. Delete or edit the JSON to correct it.
 
 Every run writes screenshots, annotated candidates and a README with timings to `WINDOWS_JEV_LOGS`
