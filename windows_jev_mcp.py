@@ -44,63 +44,59 @@ def list_windows() -> list[str]:
 def _call(fn, *args) -> dict:
     try:
         return _worker.submit(fn, *args).result()
-    except ValueError as error:
-        return {"status": "error", "message": str(error)}
+    except Exception as error:
+        return {"status": "error", "message": f"{type(error).__name__}: {error}"}
 
 
 def _describe(window: str) -> dict:
     return win_agent.Session(window, "", log=False).describe()
 
 
-def _plan(window: str, steps: list[str], params: dict | None, save_as: str | None) -> dict:
-    return win_agent.Session(window, " ; ".join(steps)).run_plan(steps, params, save_as)
+def _plan(window: str, steps: list[str]) -> dict:
+    return win_agent.Session(window, " ; ".join(steps)).run_plan(steps)
 
 
-def _action(window: str, action: str, params: dict | None) -> dict:
-    session = win_agent.Session(window, action)
-    saved = session.lib.actions.get(action)
-    if saved is None:
-        raise ValueError(f"no saved action {action!r} for {session.app}; saved: {sorted(session.lib.actions)}")
-    missing = [p for p in saved["params"] if p not in (params or {})]
-    if missing:
-        raise ValueError(f"action {action!r} needs params {missing}")
-    return session.run_plan(saved["steps"], params)
+def _explore(window: str, max_clicks: int) -> dict:
+    return win_agent.Session(window, "explore", log=False).explore(max_clicks)
 
 
 @mcp.tool()
 def describe(window: str) -> dict:
     """Start here for an app. Returns the current window's buttons and fields, its
-    screen text, the app's saved actions (name -> params), and the controls of other
-    windows of this app seen before (e.g. a compose window), so a whole task can be
-    planned as one run_steps call. Reading costs no clicks and grows the app library.
+    screen text, and `reachable`: every control on other screens of this app the
+    graph knows how to reach, with the number of clicks needed. Any of those names
+    can be used directly as a run_steps step; the route is walked automatically.
+    Reading costs no clicks.
     """
     return _call(_describe, window)
 
 
 @mcp.tool()
-def run_steps(window: str, steps: list[str], params: dict | None = None, save_as: str | None = None) -> dict:
-    """Run a planned list of steps in one call.
-
-    Each step names a control as it appears on screen ("New mail", "Seven") or is
-    type "<text>" into <field>, optionally ending in "and press enter". Steps may use
-    {placeholders} filled from `params`. Steps can span windows: when a click opens
-    a new window of the same app, the run follows it, and controls the library already
-    knows are waited for (up to 3 s) while that window opens.
-
-    Grounding is exact name first, then the app library, then one batched Jev call,
-    so repeat runs need no Jev at all. Pass `save_as` to store the steps (with their
-    placeholders) as a reusable action once the run succeeds; replay it with
-    run_action. Stops at the first step with no matching control; clicks that changed
-    nothing are flagged screen_changed=false. Returns per-step timings in ms and the
-    final screen_text for verification.
+def explore(window: str, max_clicks: int = 40) -> dict:
+    """Grow the app's graph by clicking each tab (ribbon tabs, settings tabs) once.
+    Only tab controls are clicked, never buttons, and names like Send, Delete or
+    Close are skipped. Returns the screens and links known and what is now reachable.
     """
-    return _call(_plan, window, steps, params, save_as)
+    return _call(_explore, window, max_clicks)
 
 
 @mcp.tool()
-def run_action(window: str, action: str, params: dict | None = None) -> dict:
-    """Replay a saved action (see describe -> saved_actions) with its params in one call."""
-    return _call(_action, window, action, params)
+def run_steps(window: str, steps: list[str]) -> dict:
+    """Run a planned list of steps in one call.
+
+    Each step names a control ("New mail", "Seven", "Table") or is
+    type "<text>" into <field>, optionally ending in "and press enter". A control
+    that is not on screen but known in the app graph (see describe -> reachable) is
+    reached by walking the shortest known click path first, so only the target
+    needs to be named. Runs follow new windows the app opens and wait up to 3 s for
+    known controls while a window opens. Every click grows the graph.
+
+    Grounding is exact name, then a learned grounding, then the graph, then one
+    batched Jev call. Stops at the first step with no matching control; clicks that
+    changed nothing are flagged screen_changed=false. Returns per-step timings in ms
+    (with the route walked) and the final screen_text for verification.
+    """
+    return _call(_plan, window, steps)
 
 
 @mcp.tool()

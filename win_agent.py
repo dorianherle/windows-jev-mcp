@@ -20,6 +20,7 @@ import os
 import re
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from ctypes import wintypes
 from datetime import datetime
@@ -220,8 +221,9 @@ _uia = None
 def uia_candidates(hwnd: int, rect: tuple[int, int, int, int]) -> list[dict]:
     """All named on-screen controls in one cross-process call (FindAllBuildCache)."""
     global _uia
+    import comtypes
+
     if _uia is None:
-        import comtypes
         import comtypes.client
 
         comtypes.client.GetModule("UIAutomationCore.dll")
@@ -252,10 +254,14 @@ def uia_candidates(hwnd: int, rect: tuple[int, int, int, int]) -> list[dict]:
     seen = set()
     for index in range(found.Length):
         element = found.GetElement(index)
-        name = (element.CachedName or "").strip()[:60]
-        kind = element.CachedControlType
-        box = element.CachedBoundingRectangle
-        if not name or element.CachedIsOffscreen or not element.CachedIsEnabled or kind in _UIA_SKIP_TYPES:
+        try:
+            name = (element.CachedName or "").strip()[:60]
+            kind = element.CachedControlType
+            box = element.CachedBoundingRectangle
+            hidden = element.CachedIsOffscreen or not element.CachedIsEnabled
+        except comtypes.COMError:  # UIA_E_ELEMENTNOTAVAILABLE: removed while the app redraws (WebView2)
+            continue
+        if not name or hidden or kind in _UIA_SKIP_TYPES:
             continue
         x1, y1 = max(0, box.left - left), max(0, box.top - top)
         x2, y2 = min(width, box.right - left), min(height, box.bottom - top)
@@ -265,12 +271,15 @@ def uia_candidates(hwnd: int, rect: tuple[int, int, int, int]) -> list[dict]:
         label = f"{name} ({_region((x1 + x2) / 2, (y1 + y2) / 2, width, height)})"
         editable = kind in _UIA_EDITABLE_TYPES
         if editable:
-            value = element.GetCachedPropertyValue(U.UIA_ValueValuePropertyId)
+            try:
+                value = element.GetCachedPropertyValue(U.UIA_ValueValuePropertyId)
+            except comtypes.COMError:
+                value = None
             label += f" [editable, contains '{value[:40]}']" if isinstance(value, str) and value else " [editable, empty]"
         out.append(
             {
                 "text": name, "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                "kind": "uia_text" if kind == 50020 else "uia", "editable": editable, "label": label,
+                "kind": "uia_text" if kind == 50020 else "uia", "ctype": kind, "editable": editable, "label": label,
             }
         )
     return out
@@ -532,18 +541,23 @@ def process_of(hwnd: int) -> tuple[int, str]:
     return pid.value, name or f"pid{pid.value}"
 
 
-def fill(template: str, params: dict) -> str:
-    for key, value in params.items():
-        template = template.replace("{" + key + "}", str(value))
-    return template
+_RISKY = re.compile(
+    r"\b(delete|remove|send|discard|close|exit|quit|sign ?out|log ?out|uninstall|reset|erase|"
+    r"shut ?down|restart|empty|clear|purge|archive|block|report|pay|buy|submit|publish|share)\b",
+    re.I,
+)
+
+
+def _norm(text: str) -> str:
+    return " ".join(text.lower().split())
 
 
 class Library:
-    """What one app looks like and how to drive it, persisted as JSON between runs.
+    """One app's navigation graph and learned groundings, persisted as JSON between runs.
 
+    reveals:   control name -> control names that appeared after clicking it (tab, menu,
+               dialog, new window). Routes are chains of these from what is visible now.
     grounding: "click|new email" -> control name, learned from steps that worked.
-    actions:   saved step lists with {placeholders}, replayed by run_action.
-    windows:   window title -> control names seen there, so callers can plan screens not open yet.
     """
 
     def __init__(self, app: str, root: Path = LIBRARY):
@@ -551,16 +565,54 @@ class Library:
         data = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
         self.app = app
         self.grounding: dict[str, str] = data.get("grounding", {})
-        self.actions: dict[str, dict] = data.get("actions", {})
-        self.windows: dict[str, list[str]] = data.get("windows", {})
+        self.reveals: dict[str, list[str]] = data.get("reveals", {})
 
     @staticmethod
     def _key(target: str, action: str) -> str:
-        return f"{action}|{' '.join(target.lower().split())}"
+        return f"{action}|{_norm(target)}"
+
+    def record(self, control: str, before: set[str], after: set[str]) -> None:
+        appeared = sorted(after - before)
+        # ponytail: a click counts as navigation only when >= 3 controls appear, so a click that
+        # just renames one control (Calculator "Clear" -> "Clear entry") never becomes a route.
+        # Ceiling: menus with only one or two entries are not learned.
+        if len(appeared) >= 3:
+            self.reveals[control] = appeared[:300]
+
+    def path_to(self, visible: set[str], target: str) -> list[str] | None:
+        """Shortest chain of controls to click, starting from a visible one, that reveals `target`."""
+        wanted = _norm(target)
+        queue = deque((c, [c]) for c in sorted(visible) if c in self.reveals)
+        seen = set(visible)
+        while queue:
+            control, path = queue.popleft()
+            for name in self.reveals[control]:
+                if _norm(name) == wanted:
+                    return path
+                if name not in seen and name in self.reveals:
+                    seen.add(name)
+                    queue.append((name, path + [name]))
+        return None
+
+    def reachable(self, visible: set[str]) -> dict[str, int]:
+        """Control name -> clicks needed to bring it on screen, for controls not visible now."""
+        found: dict[str, int] = {}
+        queue = deque((c, 1) for c in sorted(visible) if c in self.reveals)
+        seen = set(visible)
+        while queue:
+            control, depth = queue.popleft()
+            for name in self.reveals[control]:
+                if name in seen:
+                    continue
+                seen.add(name)
+                found[name] = depth
+                if name in self.reveals:
+                    queue.append((name, depth + 1))
+        return found
 
     def lookup(self, target: str, action: str, offered: list[dict]) -> dict | None:
         """A visible control for this step without asking Jev: exact name, else a learned one."""
-        wanted = " ".join(target.lower().split())
+        wanted = _norm(target)
         exact = [c for c in offered if c["action"] == action and c["text"].lower() == wanted]
         if len(exact) == 1:
             return exact[0]
@@ -575,16 +627,9 @@ class Library:
         # delete the app's JSON file to correct it.
         self.grounding[self._key(target, action)] = name
 
-    def observe(self, title: str, offered: list[dict]) -> None:
-        names = list(dict.fromkeys(c["text"] + (" [field]" if c.get("editable") else "") for c in offered))
-        self.windows.pop(title, None)
-        self.windows[title] = names[:150]
-        while len(self.windows) > 30:
-            self.windows.pop(next(iter(self.windows)))
-
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        data = {"app": self.app, "grounding": self.grounding, "actions": self.actions, "windows": self.windows}
+        data = {"app": self.app, "reveals": self.reveals, "grounding": self.grounding}
         temp = self.path.with_suffix(".tmp")
         temp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         os.replace(temp, self.path)
@@ -605,6 +650,8 @@ class Session:
         if self.app == "applicationframehost":  # every UWP app (Calculator, Settings) lives in this host
             self.app = self.title.lower()
         self.lib = Library(self.app)
+        self.names: set[str] = set()  # control names visible at the last read
+        self._clicked: tuple[str, set[str]] | None = None  # (control, names before) of the last click
         self.goal = goal
         self.max_steps = max_steps
         self.history: list[str] = []
@@ -647,8 +694,7 @@ class Session:
         while self.step < self.max_steps:
             self.step += 1
             t_step = time.perf_counter()
-            rect = window_rect(self.hwnd)
-            candidates, shot, timing = self._read(rect, self._pool.submit(grab, rect))
+            rect, candidates, shot, timing, _ = self._look()
             offered = offer(candidates, self.dead, self.typed)
             screen = screen_text(candidates)
             answer, jev_ms = ask_jev(self.goal, offered, self.history, screen)
@@ -703,15 +749,24 @@ class Session:
             self.hwnd, self.title = front, buffer.value
 
     def _look(self):
+        """Read the front window of the app and record what the last click revealed."""
         self._follow()
         rect = window_rect(self.hwnd)
         candidates, shot, timing = self._read(rect, self._pool.submit(grab, rect))
         offered = offer(candidates, set(), set())
-        self.lib.observe(self.title, offered)
+        self.names = {c["text"] for c in offered}
+        if self._clicked is not None:
+            self.lib.record(self._clicked[0], self._clicked[1], self.names)
+            self._clicked = None
         return rect, candidates, shot, timing, offered
 
+    def _hop(self, control: dict, rect, shot) -> bool:
+        self._clicked = (control["text"], self.names)
+        click(rect[0] + (control["x1"] + control["x2"]) // 2, rect[1] + (control["y1"] + control["y2"]) // 2)
+        return settle(rect, shot)[1]
+
     def describe(self) -> dict:
-        """The current window's controls plus everything the library knows about this app."""
+        """The current window's controls plus every control the graph knows how to reach."""
         _rect, candidates, _shot, _timing, offered = self._look()
         self.lib.save()
         return {
@@ -720,24 +775,49 @@ class Session:
             "buttons": list(dict.fromkeys(c["text"] for c in offered if c["action"] == "click" and not c.get("editable"))),
             "fields": list(dict.fromkeys(c["text"] for c in offered if c["action"] == "type")),
             "screen_text": screen_text(candidates),
-            "saved_actions": {name: action["params"] for name, action in self.lib.actions.items()},
-            "known_windows": {title: names for title, names in self.lib.windows.items() if title != self.title},
-            "library": str(self.lib.path),
+            "reachable": self.lib.reachable(self.names),
+            "graph": {"routes": len(self.lib.reveals), "file": str(self.lib.path)},
         }
 
-    def run_plan(self, steps: list[str], params: dict | None = None, save_as: str | None = None) -> dict:
+    def explore(self, max_clicks: int = 40) -> dict:
+        """Map the app by clicking each tab (TabItem) once; tabs only switch views.
+
+        Other controls are never clicked here: in apps like Outlook an unknown button can
+        send, delete or move data. Everything else is learned from normal runs.
+        """
+        focus(self.hwnd)
+        rect, _candidates, shot, _timing, offered = self._look()
+        clicked: set[str] = set()
+        while len(clicked) < max_clicks:
+            todo = [
+                c for c in offered
+                if c["action"] == "click" and c.get("ctype") == 50019
+                and c["text"] not in clicked and not _RISKY.search(c["text"])
+            ]
+            if not todo:
+                break
+            clicked.add(todo[0]["text"])
+            self._hop(todo[0], rect, shot)
+            rect, _candidates, shot, _timing, offered = self._look()
+        self.lib.save()
+        return {
+            "app": self.app,
+            "tabs_clicked": sorted(clicked),
+            "routes": len(self.lib.reveals),
+            "total_ms": round((time.perf_counter() - self.started) * 1000, 1),
+            "reachable": self.lib.reachable(self.names),
+        }
+
+    def run_plan(self, steps: list[str]) -> dict:
         """Execute caller-planned steps; each step is grounded to a control as cheaply as possible.
 
-        Order: exact control name on screen, then the app library, then Jev. Jev grounds all
-        remaining unknown steps in one request and its answers are reused while the set of
-        clickable controls stays the same. A step the library knows but cannot see yet
-        (a window still opening) is waited for up to 3 s.
+        Order: exact control name on screen, then a learned grounding, then a walk along the
+        app graph to a screen that shows the control, then Jev. Jev grounds all remaining
+        unknown steps in one request and its answers are reused while the set of clickable
+        controls stays the same. A step the library knows but cannot see yet (a window still
+        opening) is waited for up to 3 s.
         """
-        params = params or {}
-        plan = []
-        for step in steps:
-            target, text, press_enter = parse_step(step)
-            plan.append((fill(target, params), None if text is None else fill(text, params), press_enter))
+        plan = [parse_step(step) for step in steps]
         focus(self.hwnd)
         picks: dict[int, dict] = {}
         layout = None
@@ -747,12 +827,23 @@ class Session:
             action = "click" if text is None else "type"
             rect, candidates, shot, timing, offered = self._look()
             chosen = self.lib.lookup(target, action, offered)
-            if chosen is None and self.lib.knows(target, action):
+            path = self.lib.path_to(self.names, target) if chosen is None else None
+            if chosen is None and not path and self.lib.knows(target, action):
                 while chosen is None and time.perf_counter() - t_step < 3.0:
                     time.sleep(0.05)
                     rect, candidates, shot, timing, offered = self._look()
                     chosen = self.lib.lookup(target, action, offered)
-            grounded_by, jev_ms = "library", 0.0
+            grounded_by, jev_ms, route = "library", 0.0, []
+            if chosen is None:
+                for name in path or []:
+                    hop = next((c for c in offered if c["action"] == "click" and c["text"] == name), None)
+                    if hop is None:
+                        break
+                    self._hop(hop, rect, shot)
+                    route.append(name)
+                    rect, candidates, shot, timing, offered = self._look()
+                chosen = self.lib.lookup(target, action, offered) if route else None
+                grounded_by = "graph"
             if chosen is None:
                 grounded_by = "jev"
                 by_box = {_box_key(c): c for c in offered}
@@ -774,6 +865,7 @@ class Session:
                 "offered": len(offered),
                 "instruction": steps[index],
                 "grounded_by": grounded_by,
+                "route": route,
                 "target": chosen["label"] if chosen else None,
             }
             if chosen is None:
@@ -782,20 +874,23 @@ class Session:
             self._act(chosen, rect, shot, offered, record, t_step, text, press_enter)
             if record["screen_changed"] or text is not None:
                 self.lib.learn(target, action, chosen["text"])
-        if save_as:
-            self.lib.actions[save_as] = {"steps": steps, "params": sorted(params)}
         return self._with_screen(self._finish("done", None, None, None, None))
 
     def _with_screen(self, summary: dict) -> dict:
-        self._follow()
+        """Final read: links the last click into the graph and returns what the screen says."""
         summary["app"] = self.app
+        self._follow()
         if user32.IsWindow(self.hwnd):
-            summary["screen_text"] = screen_text(uia_candidates(self.hwnd, window_rect(self.hwnd)))
+            _rect, candidates, _shot, _timing, _offered = self._look()
+            summary["screen_text"] = screen_text(candidates)
+        self.lib.save()
         return summary
 
     def _act(self, chosen, rect, shot, offered, record, t_step, text, press_enter) -> None:
         cx = rect[0] + (chosen["x1"] + chosen["x2"]) // 2
         cy = rect[1] + (chosen["y1"] + chosen["y2"]) // 2
+        if text is None:
+            self._clicked = (chosen["text"], self.names)
         click(cx, cy)
         if text is not None:
             if set_value(cx, cy, text):
@@ -832,7 +927,7 @@ class Session:
                 {
                     k: r.get(k)
                     for k in (
-                        "step", "source", "grounded_by", "read_ms", "jev_ms", "think_ms", "settle_ms",
+                        "step", "source", "grounded_by", "route", "read_ms", "jev_ms", "think_ms", "settle_ms",
                         "screen_changed", "action",
                     )
                 }
@@ -961,13 +1056,22 @@ def _self_check() -> None:
         assert lib.lookup("go", "click", offered)["text"] == "Go"
         assert lib.lookup("Send it", "click", offered) is None and not lib.knows("Send it", "click")
         lib.learn("Send  it", "click", "Go")
-        lib.actions["mail"] = {"steps": ['type "{to}" into Search', "Send it"], "params": ["to"]}
-        lib.observe("Main", offered)
+        home = {"Home", "Insert", "New mail", "Reply"}
+        insert = {"Home", "Insert", "Table", "Picture", "Link"}
+        lib.record("Insert", home, insert)
+        lib.record("Table", insert, insert | {"Rows", "Columns", "OK"})
+        lib.record("Seven", home, home | {"Clear entry"})  # one renamed control is not navigation
+        assert "Seven" not in lib.reveals
+        assert lib.path_to(home, "picture") == ["Insert"]
+        assert lib.path_to(home, "Columns") == ["Insert", "Table"]
+        assert lib.path_to(insert, "Columns") == ["Table"]
+        assert lib.path_to(home, "Reply") is None
+        assert lib.reachable(home) == {"Link": 1, "Picture": 1, "Table": 1, "Columns": 2, "OK": 2, "Rows": 2}
         lib.save()
         again = Library("demo app", Path(root))
         assert again.lookup("send it", "click", offered)["text"] == "Go"
-        assert again.windows == {"Main": ["Search [field]", "Go"]} and "mail" in again.actions
-    assert fill('{to} and {to}, not {x}', {"to": "a@b.c"}) == "a@b.c and a@b.c, not {x}"
+        assert again.path_to(home, "Columns") == ["Insert", "Table"]
+    assert _RISKY.search("Send") and _RISKY.search("Delete all") and not _RISKY.search("Insert")
     print("self-check ok")
 
 
