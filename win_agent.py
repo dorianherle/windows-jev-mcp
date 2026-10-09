@@ -240,6 +240,10 @@ def uia_candidates(hwnd: int, rect: tuple[int, int, int, int]) -> list[dict]:
             U.UIA_IsEnabledPropertyId,
             U.UIA_IsOffscreenPropertyId,
             U.UIA_ValueValuePropertyId,
+            U.UIA_ValueIsReadOnlyPropertyId,
+            U.UIA_IsValuePatternAvailablePropertyId,
+            U.UIA_IsTextPatternAvailablePropertyId,
+            U.UIA_IsKeyboardFocusablePropertyId,
         ):
             request.AddProperty(prop)
         request.TreeScope = U.TreeScope_Element
@@ -259,9 +263,18 @@ def uia_candidates(hwnd: int, rect: tuple[int, int, int, int]) -> list[dict]:
             kind = element.CachedControlType
             box = element.CachedBoundingRectangle
             hidden = element.CachedIsOffscreen or not element.CachedIsEnabled
+            read_only = element.GetCachedPropertyValue(U.UIA_IsValuePatternAvailablePropertyId) is True and (
+                element.GetCachedPropertyValue(U.UIA_ValueIsReadOnlyPropertyId) is True
+            )
+            rich = element.GetCachedPropertyValue(U.UIA_IsTextPatternAvailablePropertyId) is True and (
+                element.GetCachedPropertyValue(U.UIA_IsKeyboardFocusablePropertyId) is True
+            )
         except comtypes.COMError:  # UIA_E_ELEMENTNOTAVAILABLE: removed while the app redraws (WebView2)
             continue
-        if not name or hidden or kind in _UIA_SKIP_TYPES:
+        # A web page's document reports its URL as a read-only value; a contenteditable box
+        # (Outlook's To line) is a focusable Group with a TextPattern and no ValuePattern.
+        editable = not read_only and (kind in _UIA_EDITABLE_TYPES or (rich and kind != 50030))
+        if not name or hidden or (kind in _UIA_SKIP_TYPES and not editable):
             continue
         x1, y1 = max(0, box.left - left), max(0, box.top - top)
         x2, y2 = min(width, box.right - left), min(height, box.bottom - top)
@@ -269,7 +282,6 @@ def uia_candidates(hwnd: int, rect: tuple[int, int, int, int]) -> list[dict]:
             continue
         seen.add((name, x1, y1))
         label = f"{name} ({_region((x1 + x2) / 2, (y1 + y2) / 2, width, height)})"
-        editable = kind in _UIA_EDITABLE_TYPES
         if editable:
             try:
                 value = element.GetCachedPropertyValue(U.UIA_ValueValuePropertyId)
@@ -975,7 +987,9 @@ class Session:
             if set_value(cx, cy, text):
                 type_text("\n" if press_enter else "")
             else:
-                time.sleep(0.05)
+                # Web fields re-render as they take focus (Outlook's To line opens a suggestion
+                # popup) and drop keystrokes sent meanwhile.
+                settle(rect, shot)
                 type_text(text + ("\n" if press_enter else ""))
             action = f"type {text!r} into {chosen['text']}"
             self.typed.add(chosen["text"])
