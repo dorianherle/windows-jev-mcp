@@ -840,9 +840,8 @@ class Session:
         candidates, shot, timing = self._read(rect, self._pool.submit(grab, rect))
         offered = offer(candidates, set(), set())
         self.names = {c["text"] for c in offered}
-        if self._clicked is not None:
+        if self._clicked is not None:  # every read until the next action refines what it revealed
             self.lib.record(self._clicked[0], self._clicked[1], self.names)
-            self._clicked = None
         return rect, candidates, shot, timing, offered
 
     def _hop(self, control: dict, rect, shot) -> bool:
@@ -912,11 +911,16 @@ class Session:
             rect, candidates, shot, timing, offered = self._look()
             chosen = lookup(target, action, offered)
             path = self.lib.path_to(self.names, target) if chosen is None else None
-            if chosen is None and not path and self.lib.knows(target):
-                while chosen is None and time.perf_counter() - t_step < 3.0:
-                    time.sleep(0.05)
-                    rect, candidates, shot, timing, offered = self._look()
-                    chosen = lookup(target, action, offered)
+            # A window still opening keeps gaining controls (Outlook's compose pane): read again
+            # until the name shows up or the controls stop changing; a known control gets 3 s.
+            while chosen is None and not path and time.perf_counter() - t_step < 3.0:
+                seen = self.names
+                time.sleep(0.05)
+                rect, candidates, shot, timing, offered = self._look()
+                chosen = lookup(target, action, offered)
+                path = self.lib.path_to(self.names, target) if chosen is None else None
+                if self.names == seen and not self.lib.knows(target):
+                    break
             grounded_by, jev_ms, route = "name", 0.0, []
             if chosen is None:
                 for name in path or []:
@@ -971,8 +975,7 @@ class Session:
     def _act(self, chosen, rect, shot, offered, record, t_step, text, press_enter) -> None:
         cx = rect[0] + (chosen["x1"] + chosen["x2"]) // 2
         cy = rect[1] + (chosen["y1"] + chosen["y2"]) // 2
-        if text is None:
-            self._clicked = (chosen["text"], self.names)
+        self._clicked = (chosen["text"], self.names) if text is None else None
         click(cx, cy)
         if text is not None:
             if set_value(cx, cy, text):
@@ -981,7 +984,12 @@ class Session:
                 # Web fields re-render as they take focus (Outlook's To line opens a suggestion
                 # popup) and drop keystrokes sent meanwhile.
                 settle(rect, shot)
-                type_text(text + ("\n" if press_enter else ""))
+                type_text(text)
+                if press_enter:
+                    # Autocomplete fields (Outlook's To line) ignore Enter until their
+                    # suggestions have rendered.
+                    settle(rect, grab(rect))
+                    type_text("\n")
             action = f"type {text!r} into {chosen['text']}"
             self.typed.add(chosen["text"])
         else:
