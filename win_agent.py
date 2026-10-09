@@ -584,7 +584,11 @@ class Library:
         return f"{action}|{_norm(target)}"
 
     def record(self, control: str, before: set[str], after: set[str]) -> None:
-        appeared = sorted(after - before)
+        if _RISKY.search(control):  # Send, Delete...: what follows is a new state, not a menu
+            return
+        # ponytail: names with a digit or over 40 chars are data (dates, times, counts, mail rows),
+        # not controls. Ceiling: real controls like "Heading 1" are never learned as revealed.
+        appeared = sorted(n for n in after - before if len(n) <= 40 and not re.search(r"\d", n))
         # ponytail: a click counts as navigation only when >= 3 controls appear, so a click that
         # just renames one control (Calculator "Clear" -> "Clear entry") never becomes a route.
         # Ceiling: menus with only one or two entries are not learned.
@@ -1155,6 +1159,9 @@ def _self_check() -> None:
         lib.record("Table", insert, insert | {"Rows", "Columns", "OK"})
         lib.record("Seven", home, home | {"Clear entry"})  # one renamed control is not navigation
         assert "Seven" not in lib.reveals
+        lib.record("Send", home, home | {"Reply", "Forward", "Delete", "Print"})
+        lib.record("Calendar", home, home | {"1, October, 2026", "09:00 Standup", "Unread External sender " * 3})
+        assert "Send" not in lib.reveals and "Calendar" not in lib.reveals
         assert lib.path_to(home, "picture") == ["Insert"]
         assert lib.path_to(home, "Columns") == ["Insert", "Table"]
         assert lib.path_to(insert, "Columns") == ["Table"]
