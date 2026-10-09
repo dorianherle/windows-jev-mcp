@@ -1,0 +1,7 @@
+-r requirements.txt
+winocr>=0.0.15
+openvino>=2025.0
+torch
+torchvision
+huggingface_hub
+numpy

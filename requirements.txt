@@ -1,0 +1,4 @@
+mcp>=1.23
+comtypes>=1.4
+mss>=10.0
+pillow>=11.0
