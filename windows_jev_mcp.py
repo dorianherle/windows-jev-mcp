@@ -80,6 +80,43 @@ def explore(window: str, max_clicks: int = 40) -> dict:
     return _call(_explore, window, max_clicks)
 
 
+def _show(app: str) -> dict:
+    lib = win_agent.library_for(app)
+    page = lib.path.with_suffix(".html")
+    page.parent.mkdir(parents=True, exist_ok=True)
+    page.write_text(lib.html(), encoding="utf-8")
+    os.startfile(page)
+    return {"app": lib.app, "page": str(page), "routes": len(lib.reveals), "groundings": len(lib.grounding)}
+
+
+def _edit(app: str, control: str, add: list[str] | None, remove: list[str] | None, delete: bool) -> dict:
+    lib = win_agent.library_for(app)
+    lib.edit(control, add, remove, delete)
+    lib.save()
+    return {"app": lib.app, "control": control, "reveals": lib.reveals.get(control, []), "routes": len(lib.reveals)}
+
+
+@mcp.tool()
+def show_graph(app: str) -> dict:
+    """Open the app's saved link tree as an HTML page in the browser.
+
+    `app` is an app name ("olk", "calculator") or part of an open window's title.
+    Each control expands into the controls clicking it reveals; the page has a filter
+    box and lists the learned groundings.
+    """
+    return _call(_show, app)
+
+
+@mcp.tool()
+def edit_graph(
+    app: str, control: str, add: list[str] | None = None, remove: list[str] | None = None, delete: bool = False
+) -> dict:
+    """Edit the app's link tree: `add` / `remove` names from what clicking `control`
+    reveals, or `delete` the control's routes entirely. Takes effect for the next run.
+    """
+    return _call(_edit, app, control, add, remove, delete)
+
+
 @mcp.tool()
 def run_steps(window: str, steps: list[str]) -> dict:
     """Run a planned list of steps in one call.

@@ -610,6 +610,68 @@ class Library:
                     queue.append((name, depth + 1))
         return found
 
+    def edit(self, control: str, add: list[str] | None = None, remove: list[str] | None = None, delete: bool = False) -> None:
+        """Hand-correct what clicking `control` reveals; an emptied control is dropped."""
+        dropped = set(remove or [])
+        names = [] if delete else [n for n in self.reveals.get(control, []) if n not in dropped]
+        names += [n for n in add or [] if n not in names]
+        if names:
+            self.reveals[control] = names
+        else:
+            self.reveals.pop(control, None)
+
+    def html(self) -> str:
+        """Standalone page: every route as a collapsible tree, plus the learned groundings."""
+        import html as h
+
+        revealed = {n for names in self.reveals.values() for n in names}
+        roots = [c for c in sorted(self.reveals) if c not in revealed]
+        placed: set[str] = set()
+
+        def branch(control: str, ancestors: frozenset) -> str:
+            placed.add(control)
+            label = h.escape(control)
+            if control not in self.reveals:
+                return f"<li>{label}</li>"
+            if control in ancestors:
+                return f"<li>{label} <i>(loop)</i></li>"
+            children = "".join(branch(n, ancestors | {control}) for n in self.reveals[control])
+            count = len(self.reveals[control])
+            return f"<li><details><summary><b>{label}</b> <small>reveals {count}</small></summary><ul>{children}</ul></details></li>"
+
+        trees = "".join(branch(c, frozenset()) for c in roots)
+        # Controls only reachable through loops have no root; show them at top level too.
+        trees += "".join(branch(c, frozenset()) for c in sorted(self.reveals) if c not in placed)
+        rows = "".join(
+            f"<tr><td>{h.escape(k.split('|', 1)[0])}</td><td>{h.escape(k.split('|', 1)[1])}</td><td>{h.escape(v)}</td></tr>"
+            for k, v in sorted(self.grounding.items())
+        )
+        return f"""<!doctype html><meta charset="utf-8"><title>{h.escape(self.app)} link tree</title>
+<style>
+body{{font:14px system-ui,sans-serif;margin:24px;max-width:1100px}} ul{{list-style:none;padding-left:18px;margin:2px 0}}
+li{{margin:1px 0}} summary{{cursor:pointer}} small{{color:#777}} .hit{{background:#ffe066}}
+input{{font-size:14px;padding:6px;width:320px}} table{{border-collapse:collapse;margin-top:8px}}
+td,th{{border:1px solid #ddd;padding:3px 8px;text-align:left}}
+</style>
+<h1>{h.escape(self.app)}</h1>
+<p>{len(self.reveals)} controls with routes, {len(revealed)} controls reachable through them. Source: <code>{h.escape(str(self.path))}</code></p>
+<p><input id="q" placeholder="Filter controls..." autofocus> <button onclick="all(true)">Expand all</button> <button onclick="all(false)">Collapse all</button></p>
+<ul id="tree">{trees}</ul>
+<h2>Learned groundings</h2>
+<table><tr><th>Action</th><th>Step text</th><th>Control</th></tr>{rows}</table>
+<script>
+const all = open => document.querySelectorAll('details').forEach(d => d.open = open);
+document.getElementById('q').oninput = e => {{
+  const q = e.target.value.trim().toLowerCase();
+  document.querySelectorAll('#tree li').forEach(li => {{
+    const own = (li.querySelector(':scope > details > summary b') || li).firstChild.textContent.toLowerCase();
+    li.classList.toggle('hit', !!q && own.includes(q));
+    li.style.display = !q || li.textContent.toLowerCase().includes(q) ? '' : 'none';
+    if (q) li.querySelectorAll(':scope > details').forEach(d => d.open = true);
+  }});
+}};
+</script>"""
+
     def lookup(self, target: str, action: str, offered: list[dict]) -> dict | None:
         """A visible control for this step without asking Jev: exact name, else a learned one."""
         wanted = _norm(target)
@@ -635,6 +697,25 @@ class Library:
         os.replace(temp, self.path)
 
 
+def app_of(hwnd: int, title: str) -> tuple[int, str]:
+    pid, app = process_of(hwnd)
+    if app == "applicationframehost":  # every UWP app (Calculator, Settings) lives in this host
+        app = title.lower()
+    return pid, app
+
+
+def library_for(name: str) -> Library:
+    """An app's library by app name ("olk", "calculator") or by part of an open window's title."""
+    saved = Library(name.lower())
+    if saved.path.exists():
+        return saved
+    match = [(h, t) for h, t in enum_windows() if name.lower() in t.lower()]
+    if not match:
+        apps = sorted(p.stem for p in LIBRARY.glob("*.json"))
+        raise ValueError(f"no saved graph or open window for {name!r}; saved apps: {apps}")
+    return Library(app_of(*match[0])[1])
+
+
 # ---------------------------------------------------------------- session
 
 
@@ -646,9 +727,7 @@ class Session:
         if not match:
             raise ValueError(f"no visible window title contains {window!r}")
         self.hwnd, self.title = match[0]
-        self.pid, self.app = process_of(self.hwnd)
-        if self.app == "applicationframehost":  # every UWP app (Calculator, Settings) lives in this host
-            self.app = self.title.lower()
+        self.pid, self.app = app_of(self.hwnd, self.title)
         self.lib = Library(self.app)
         self.names: set[str] = set()  # control names visible at the last read
         self._clicked: tuple[str, set[str]] | None = None  # (control, names before) of the last click
@@ -1071,6 +1150,14 @@ def _self_check() -> None:
         again = Library("demo app", Path(root))
         assert again.lookup("send it", "click", offered)["text"] == "Go"
         assert again.path_to(home, "Columns") == ["Insert", "Table"]
+        again.edit("Rows", add=["Insert"])  # a loop must not recurse forever
+        page = again.html()
+        assert "<b>Insert</b>" in page and "Columns" in page and "(loop)" in page and "send it" in page
+        again.edit("Insert", remove=["Table"], add=["Chart"])
+        assert again.reveals["Insert"] == ["Link", "Picture", "Chart"]
+        again.edit("Table", remove=["Rows", "Columns", "OK"])
+        again.edit("Rows", delete=True)
+        assert "Table" not in again.reveals and "Rows" not in again.reveals
     assert _RISKY.search("Send") and _RISKY.search("Delete all") and not _RISKY.search("Insert")
     print("self-check ok")
 

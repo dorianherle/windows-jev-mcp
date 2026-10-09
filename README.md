@@ -17,6 +17,8 @@ Measured on Windows Calculator: a 6-click calculation in about 1.1 s end to end,
 |---|---|
 | `list_windows()` | Titles of visible top-level windows. |
 | `describe(window)` | Start here. Buttons, fields and screen text of the current window, plus `reachable`: controls elsewhere in the app the graph can reach, with the clicks needed. No clicks. |
+| `show_graph(app)` | Open the app's saved link tree as an HTML page (collapsible tree, filter box, learned groundings). `app` is a name like `olk` / `calculator` or part of a window title. |
+| `edit_graph(app, control, add=None, remove=None, delete=False)` | Correct the link tree: add or remove what clicking `control` reveals, or delete its routes. |
 | `explore(window, max_clicks=40)` | Grow the app graph by clicking each tab once (ribbon tabs, settings tabs). Never clicks buttons; skips names like Send, Delete, Close. |
 | `run_steps(window, steps)` | Run a whole plan in one call. Each step names a control (`"Seven"`, `"New mail"`, `"Density"`) or is `type "<text>" into <field>` (optionally `... and press enter`). A control that is not on screen but known to the graph is reached by walking the learned route first. Follows new windows the app opens. Stops at the first step that finds no control; clicks that changed nothing are flagged `screen_changed: false`. Returns per-step timings in ms, the route walked, and the final `screen_text`. |
 | `run_goal(window, goal, max_steps=12)` | Jev picks every step itself. When a field needs text it returns `needs_text`; answer with `provide_text`. Slower and weaker at ordered input such as numbers. |
