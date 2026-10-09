@@ -16,9 +16,23 @@ Measured on Windows Calculator: a 6-click calculation in about 1.1 s end to end,
 | Tool | Use |
 |---|---|
 | `list_windows()` | Titles of visible top-level windows. |
-| `run_steps(window, steps)` | Fastest and most reliable. Each step names a control as it appears on screen (`"Seven"`, `"Add New Tab"`) or is `type "<text>" into <field>` (optionally `... and press enter`). Stops at the first step that finds no control; clicks that changed nothing are flagged `screen_changed: false`. Returns per-step timings in ms and the window's `screen_text` for verification. |
+| `describe(window)` | Start here. Buttons, fields and screen text of the current window, plus the app's saved actions and the controls of other windows of the app seen before. No clicks. |
+| `run_steps(window, steps, params=None, save_as=None)` | Run a whole plan in one call. Each step names a control as it appears on screen (`"Seven"`, `"New mail"`) or is `type "<text>" into <field>` (optionally `... and press enter`); `{placeholders}` are filled from `params`. Follows new windows the app opens. `save_as` stores the steps as a reusable action. Stops at the first step that finds no control; clicks that changed nothing are flagged `screen_changed: false`. Returns per-step timings in ms and the final `screen_text`. |
+| `run_action(window, action, params)` | Replay a saved action, e.g. `send_email(to, subject, body)`, in one call. |
 | `run_goal(window, goal, max_steps=12)` | Jev picks every step itself. When a field needs text it returns `needs_text`; answer with `provide_text`. Slower and weaker at ordered input such as numbers. |
 | `provide_text(text, press_enter=False)` | Continue a paused `run_goal`. |
+
+### Per-app library
+
+Each app gets a JSON file in `WINDOWS_JEV_LIBRARY` (default `~/windows_jev_library`, e.g. `olk.json` for new Outlook):
+
+- `grounding`: step text -> control name, learned from steps that worked. A step is grounded by exact name first,
+  then this cache, and only then by Jev, so repeated tasks need no Jev call.
+- `actions`: saved step lists with placeholders, replayed by `run_action`.
+- `windows`: control names per window title, so the caller can plan screens that are not open yet.
+
+The library only learns from reading windows and from successful runs. It never explores by clicking, because
+clicking unknown buttons in apps like Outlook can send, delete or move data. Delete or edit the JSON to correct it.
 
 Every run writes screenshots, annotated candidates and a README with timings to `WINDOWS_JEV_LOGS`
 (default `~/windows_jev_runs`).

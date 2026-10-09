@@ -33,6 +33,7 @@ except OSError:
 from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 RUNS = Path(os.environ.get("WINDOWS_JEV_LOGS") or Path.home() / "windows_jev_runs")
+LIBRARY = Path(os.environ.get("WINDOWS_JEV_LIBRARY") or Path.home() / "windows_jev_library")
 JEV_HOST = "api.typesafe.ai"
 JEV_MODEL = "jev-1.13.0"
 # ponytail: Jev Choice takes at most 255 options, so later candidates are dropped.
@@ -461,12 +462,12 @@ def parse_step(step: str) -> tuple[str, str | None, bool]:
     return re.sub(r"^click\s+", "", step.strip(), flags=re.I), None, False
 
 
-def ask_targets(steps: list[str], offered: list[dict], screen: list[str]) -> tuple[dict[int, dict], float]:
-    """Ground every step against the current screen in one request; Jev answers each independently."""
+def ask_targets(
+    items: list[tuple[int, str, str]], offered: list[dict], screen: list[str]
+) -> tuple[dict[int, dict], float]:
+    """Ground (index, target, action) items in one request; Jev answers each independently."""
     questions = {}
-    for index, step in enumerate(steps):
-        target, text, _ = parse_step(step)
-        action = "click" if text is None else "type"
+    for index, target, action in items:
         criteria = {c["id"]: c["label"] for c in offered if c["action"] == action}
         if criteria:
             questions[f"s{index}"] = {
@@ -512,6 +513,83 @@ def _post(body: str) -> tuple[dict, float]:
     raise RuntimeError("unreachable")
 
 
+# ---------------------------------------------------------------- per-app library
+
+
+def process_of(hwnd: int) -> tuple[int, str]:
+    """(pid, lowercase exe stem) of the process owning a window."""
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+    name = ""
+    if handle:
+        buffer = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(1024)
+        if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            name = Path(buffer.value).stem.lower()
+        kernel32.CloseHandle(handle)
+    return pid.value, name or f"pid{pid.value}"
+
+
+def fill(template: str, params: dict) -> str:
+    for key, value in params.items():
+        template = template.replace("{" + key + "}", str(value))
+    return template
+
+
+class Library:
+    """What one app looks like and how to drive it, persisted as JSON between runs.
+
+    grounding: "click|new email" -> control name, learned from steps that worked.
+    actions:   saved step lists with {placeholders}, replayed by run_action.
+    windows:   window title -> control names seen there, so callers can plan screens not open yet.
+    """
+
+    def __init__(self, app: str, root: Path = LIBRARY):
+        self.path = root / f"{re.sub(r'[^a-z0-9_.-]+', '_', app)}.json"
+        data = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
+        self.app = app
+        self.grounding: dict[str, str] = data.get("grounding", {})
+        self.actions: dict[str, dict] = data.get("actions", {})
+        self.windows: dict[str, list[str]] = data.get("windows", {})
+
+    @staticmethod
+    def _key(target: str, action: str) -> str:
+        return f"{action}|{' '.join(target.lower().split())}"
+
+    def lookup(self, target: str, action: str, offered: list[dict]) -> dict | None:
+        """A visible control for this step without asking Jev: exact name, else a learned one."""
+        wanted = " ".join(target.lower().split())
+        exact = [c for c in offered if c["action"] == action and c["text"].lower() == wanted]
+        if len(exact) == 1:
+            return exact[0]
+        learned = self.grounding.get(self._key(target, action))
+        return next((c for c in offered if c["action"] == action and c["text"] == learned), None)
+
+    def knows(self, target: str, action: str) -> bool:
+        return self._key(target, action) in self.grounding
+
+    def learn(self, target: str, action: str, name: str) -> None:
+        # ponytail: a wrong Jev grounding that still changed the screen is kept; edit or
+        # delete the app's JSON file to correct it.
+        self.grounding[self._key(target, action)] = name
+
+    def observe(self, title: str, offered: list[dict]) -> None:
+        names = list(dict.fromkeys(c["text"] + (" [field]" if c.get("editable") else "") for c in offered))
+        self.windows.pop(title, None)
+        self.windows[title] = names[:150]
+        while len(self.windows) > 30:
+            self.windows.pop(next(iter(self.windows)))
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        data = {"app": self.app, "grounding": self.grounding, "actions": self.actions, "windows": self.windows}
+        temp = self.path.with_suffix(".tmp")
+        temp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(temp, self.path)
+
+
 # ---------------------------------------------------------------- session
 
 
@@ -523,6 +601,10 @@ class Session:
         if not match:
             raise ValueError(f"no visible window title contains {window!r}")
         self.hwnd, self.title = match[0]
+        self.pid, self.app = process_of(self.hwnd)
+        if self.app == "applicationframehost":  # every UWP app (Calculator, Settings) lives in this host
+            self.app = self.title.lower()
+        self.lib = Library(self.app)
         self.goal = goal
         self.max_steps = max_steps
         self.history: list[str] = []
@@ -611,50 +693,104 @@ class Session:
         self._act(chosen, rect, shot, offered, record, t_step, text, press_enter)
         return self.advance()
 
-    def run_plan(self, steps: list[str]) -> dict:
-        """Execute caller-planned steps; Jev only grounds each step to a control.
+    def _follow(self) -> None:
+        """Switch to a new window of the same app (compose window, dialog) once it is in front."""
+        front = user32.GetForegroundWindow()
+        if front and front != self.hwnd and process_of(front)[0] == self.pid:
+            length = user32.GetWindowTextLengthW(front)
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(front, buffer, length + 1)
+            self.hwnd, self.title = front, buffer.value
 
-        All remaining steps are grounded in one request. The answers are reused while the
-        set of clickable controls stays the same, so a static screen costs one Jev call.
+    def _look(self):
+        self._follow()
+        rect = window_rect(self.hwnd)
+        candidates, shot, timing = self._read(rect, self._pool.submit(grab, rect))
+        offered = offer(candidates, set(), set())
+        self.lib.observe(self.title, offered)
+        return rect, candidates, shot, timing, offered
+
+    def describe(self) -> dict:
+        """The current window's controls plus everything the library knows about this app."""
+        _rect, candidates, _shot, _timing, offered = self._look()
+        self.lib.save()
+        return {
+            "app": self.app,
+            "window": self.title,
+            "buttons": list(dict.fromkeys(c["text"] for c in offered if c["action"] == "click" and not c.get("editable"))),
+            "fields": list(dict.fromkeys(c["text"] for c in offered if c["action"] == "type")),
+            "screen_text": screen_text(candidates),
+            "saved_actions": {name: action["params"] for name, action in self.lib.actions.items()},
+            "known_windows": {title: names for title, names in self.lib.windows.items() if title != self.title},
+            "library": str(self.lib.path),
+        }
+
+    def run_plan(self, steps: list[str], params: dict | None = None, save_as: str | None = None) -> dict:
+        """Execute caller-planned steps; each step is grounded to a control as cheaply as possible.
+
+        Order: exact control name on screen, then the app library, then Jev. Jev grounds all
+        remaining unknown steps in one request and its answers are reused while the set of
+        clickable controls stays the same. A step the library knows but cannot see yet
+        (a window still opening) is waited for up to 3 s.
         """
+        params = params or {}
+        plan = []
+        for step in steps:
+            target, text, press_enter = parse_step(step)
+            plan.append((fill(target, params), None if text is None else fill(text, params), press_enter))
         focus(self.hwnd)
         picks: dict[int, dict] = {}
         layout = None
-        for index, step in enumerate(steps):
+        for index, (target, text, press_enter) in enumerate(plan):
             self.step = index + 1
             t_step = time.perf_counter()
-            rect = window_rect(self.hwnd)
-            candidates, shot, timing = self._read(rect, self._pool.submit(grab, rect))
-            offered = offer(candidates, set(), set())
-            by_box = {_box_key(c): c for c in offered}
-            jev_ms = 0.0
-            chosen = picks.get(index)
-            current = by_box.get(_box_key(chosen)) if chosen is not None else None
-            # Renamed-in-place controls ("Clear" -> "Clear entry") keep the layout; a new or
-            # moved control (menu opened) or a renamed pick means the answers are stale.
-            if frozenset(by_box) != layout or current is None or current["label"] != chosen["label"]:
-                found, jev_ms = ask_targets(steps[index:], offered, screen_text(candidates))
-                picks = {index + k: c for k, c in found.items()}
-                layout = frozenset(by_box)
-                current = picks.get(index)
-            chosen = current
+            action = "click" if text is None else "type"
+            rect, candidates, shot, timing, offered = self._look()
+            chosen = self.lib.lookup(target, action, offered)
+            if chosen is None and self.lib.knows(target, action):
+                while chosen is None and time.perf_counter() - t_step < 3.0:
+                    time.sleep(0.05)
+                    rect, candidates, shot, timing, offered = self._look()
+                    chosen = self.lib.lookup(target, action, offered)
+            grounded_by, jev_ms = "library", 0.0
+            if chosen is None:
+                grounded_by = "jev"
+                by_box = {_box_key(c): c for c in offered}
+                chosen = picks.get(index)
+                current = by_box.get(_box_key(chosen)) if chosen is not None else None
+                # Renamed-in-place controls ("Clear" -> "Clear entry") keep the layout; a new or
+                # moved control (menu opened) or a renamed pick means the answers are stale.
+                if frozenset(by_box) != layout or current is None or current["label"] != chosen["label"]:
+                    items = [(i, t, "click" if x is None else "type") for i, (t, x, _) in enumerate(plan) if i >= index]
+                    picks, jev_ms = ask_targets(items, offered, screen_text(candidates))
+                    layout = frozenset(by_box)
+                    current = picks.get(index)
+                chosen = current
             record = {
                 "step": self.step,
                 **timing,
                 "jev_ms": round(jev_ms, 1),
                 "think_ms": round((time.perf_counter() - t_step) * 1000, 1),
                 "offered": len(offered),
-                "instruction": step,
+                "instruction": steps[index],
+                "grounded_by": grounded_by,
                 "target": chosen["label"] if chosen else None,
             }
             if chosen is None:
-                return self._finish(f"stopped: no control found for step {self.step} {step!r}", record, shot, offered, None)
-            _target, text, press_enter = parse_step(step)
+                summary = self._finish(f"stopped: no control found for step {self.step} {steps[index]!r}", record, shot, offered, None)
+                return self._with_screen(summary)
             self._act(chosen, rect, shot, offered, record, t_step, text, press_enter)
+            if record["screen_changed"] or text is not None:
+                self.lib.learn(target, action, chosen["text"])
+        if save_as:
+            self.lib.actions[save_as] = {"steps": steps, "params": sorted(params)}
         return self._with_screen(self._finish("done", None, None, None, None))
 
     def _with_screen(self, summary: dict) -> dict:
-        summary["screen_text"] = screen_text(uia_candidates(self.hwnd, window_rect(self.hwnd)))
+        self._follow()
+        summary["app"] = self.app
+        if user32.IsWindow(self.hwnd):
+            summary["screen_text"] = screen_text(uia_candidates(self.hwnd, window_rect(self.hwnd)))
         return summary
 
     def _act(self, chosen, rect, shot, offered, record, t_step, text, press_enter) -> None:
@@ -682,6 +818,7 @@ class Session:
         self.frames.append((record["step"], shot, offered, chosen))
 
     def _finish(self, status, record, shot, offered, chosen) -> dict:
+        self.lib.save()
         if record is not None:
             record["action"] = status
             self.records.append(record)
@@ -694,7 +831,10 @@ class Session:
             "steps": [
                 {
                     k: r.get(k)
-                    for k in ("step", "source", "read_ms", "jev_ms", "think_ms", "settle_ms", "screen_changed", "action")
+                    for k in (
+                        "step", "source", "grounded_by", "read_ms", "jev_ms", "think_ms", "settle_ms",
+                        "screen_changed", "action",
+                    )
                 }
                 for r in self.records
             ],
@@ -814,6 +954,20 @@ def _self_check() -> None:
     assert parse_step("type 'hi' into Text editor") == ("Text editor", "hi", False)
     many = [{"text": f"row {i}", "x1": 0, "y1": i * 20, "x2": 50, "y2": i * 20 + 15} for i in range(300)]
     assert len(build_candidates(many, [], (100, 6000))) == MAX_CANDIDATES
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as root:
+        lib = Library("demo app", Path(root))
+        assert lib.lookup("go", "click", offered)["text"] == "Go"
+        assert lib.lookup("Send it", "click", offered) is None and not lib.knows("Send it", "click")
+        lib.learn("Send  it", "click", "Go")
+        lib.actions["mail"] = {"steps": ['type "{to}" into Search', "Send it"], "params": ["to"]}
+        lib.observe("Main", offered)
+        lib.save()
+        again = Library("demo app", Path(root))
+        assert again.lookup("send it", "click", offered)["text"] == "Go"
+        assert again.windows == {"Main": ["Search [field]", "Go"]} and "mail" in again.actions
+    assert fill('{to} and {to}, not {x}', {"to": "a@b.c"}) == "a@b.c and a@b.c, not {x}"
     print("self-check ok")
 
 
