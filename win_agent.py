@@ -449,6 +449,12 @@ _jev: http.client.HTTPSConnection | None = None
 
 def api_key() -> str:
     key = os.environ.get("TYPESAFE_API_KEY", "").strip()
+    env_file = Path(__file__).with_name(".env")  # gitignored
+    if not key and env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            name, _, value = line.partition("=")
+            if name.strip() == "TYPESAFE_API_KEY":
+                key = value.strip().strip("\"'")
     if not key:
         import winreg
 

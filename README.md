@@ -67,8 +67,8 @@ Add the server to your MCP client. For Cursor, `~/.cursor/mcp.json`:
 }
 ```
 
-The key can also live in the Windows user environment variable `TYPESAFE_API_KEY` instead of the config.
-Never commit it.
+The key can also live in a `.env` file next to `win_agent.py` (`TYPESAFE_API_KEY=...`, gitignored) or in the
+Windows user environment variable `TYPESAFE_API_KEY` instead of the config. Never commit it.
 
 ### Optional: vision fallback
 
