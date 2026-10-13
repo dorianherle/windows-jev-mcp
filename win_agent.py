@@ -1076,8 +1076,7 @@ class Session:
                     "goal": self.goal,
                     "step": self.step,
                     "previous_actions": self.history,
-                    "visible_controls": [c["label"] for c in candidates][:80],
-                    "next": "Call provide_text with the exact text for this field.",
+                    "next": "Call provide_text with the exact text for this field. Do not take a screenshot.",
                 }
             self._act(chosen, rect, shot, offered, record, t_step, None, False)
         return self._finish("stopped: step budget spent", None, None, None, None)
@@ -1181,6 +1180,7 @@ class Session:
             "screen_text": screen_text(candidates),
             "reachable": self.lib.reachable(self.names),
             "graph": {"routes": len(self.lib.reveals), "file": str(self.lib.path)},
+            "note": "Names only, no image. A task goes to run_goal. Do not take a screenshot.",
         }
 
     def explore(self, max_clicks: int = 40) -> dict:
@@ -1385,7 +1385,7 @@ class Session:
         return self._with_screen(self._finish("done", None, None, None, None))
 
     def _with_screen(self, summary: dict) -> dict:
-        """Final read: links the last click into the graph and returns what the screen says."""
+        """Final read so the last click is stored in the graph. The caller does not receive the screen."""
         summary["app"] = self.app
         self._follow()
         if user32.IsWindow(self.hwnd):
@@ -1395,16 +1395,7 @@ class Session:
             if buffer.value:
                 self.title = buffer.value
             summary["window"] = self.title
-            # Enter already waited for the new page inside the plan. One read is the screen
-            # the caller plans from; a click does not pay a second poll.
-            _rect, candidates, _shot, _timing, offered = self._look()
-            summary["screen_text"] = screen_text(candidates)
-            # The calling agent plans the next step from this result, so it needs the new
-            # control names. Otherwise it has to call describe before it can continue.
-            summary["buttons"] = list(dict.fromkeys(
-                c["text"] for c in offered if c["action"] == "click" and not c.get("editable")
-            ))
-            summary["fields"] = list(dict.fromkeys(c["text"] for c in offered if c["action"] == "type"))
+            self._look()
         self.lib.save()
         return summary
 
@@ -1468,11 +1459,13 @@ class Session:
                 }
                 for r in self.records
             ],
+            "note": "Jev drove these clicks. Do not take a screenshot or open an image.",
         }
         if self.out is not None:
-            summary["log"] = str(self.out)
+            logged = dict(summary)
+            logged["log"] = str(self.out)
             final = grab(window_rect(self.hwnd))
-            _log_pool.submit(self._write, final, dict(summary))
+            _log_pool.submit(self._write, final, logged)
         return summary
 
     def _write(self, final: Image.Image, summary: dict) -> None:

@@ -137,8 +137,7 @@ def run_steps(window: str, steps: list[str]) -> dict:
     for the new page inside this call: put the steps that happen after a navigation in this
     same list, instead of returning to plan them. Stops at the first step with no matching
     control; clicks that changed nothing are flagged screen_changed=false. Returns per-step
-    timings in ms (with the route walked), the final screen_text, and the buttons and fields
-    now on screen. The window title is read again after the run.
+    timings in ms and the actions taken. No image, no button list, and no log path.
     """
     return _call(_plan, window, steps)
 

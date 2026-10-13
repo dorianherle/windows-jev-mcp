@@ -46,6 +46,7 @@ Hand the task above to Jev. Jev decides what to click. Touch only the app the ta
 - If the result says needs_text, call provide_text with the text the task asked for.
 - If it cannot call tools, run: windows-jev goal WINDOW the task
 - Do not click Send, Delete, or Close unless the task names them.
+- Do not use a screenshot tool, a screen capture, or the files under ~/windows_jev_runs. If you are unsure what is on screen, call run_goal again.
 - Stop when the status is done or stopped.
 ```
 
@@ -65,7 +66,7 @@ windows-jev run Calculator One Two Plus Seven Equals
 | **log** | `status` and the steps |
 | **score** | How many checks showed up |
 
-Jev reads control names. The tool does not return a picture. A log is kept in `~/windows_jev_runs` for a person to open later.
+Jev reads control names. The tool result has no picture and no folder path. A log is kept in `~/windows_jev_runs` for a person to open later.
 
 A step can also type: `type "https://example.com" into Address and press enter`. The later steps in that same list already see the new page.
 
