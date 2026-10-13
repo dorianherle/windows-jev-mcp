@@ -49,7 +49,7 @@ def _call(fn, *args) -> dict:
 
 
 def _describe(window: str) -> dict:
-    return win_agent.Session(window, "", log=False).describe()
+    return win_agent.Session(window, "").describe()
 
 
 def _plan(window: str, steps: list[str]) -> dict:
@@ -57,7 +57,7 @@ def _plan(window: str, steps: list[str]) -> dict:
 
 
 def _explore(window: str, max_clicks: int) -> dict:
-    return win_agent.Session(window, "explore", log=False).explore(max_clicks)
+    return win_agent.Session(window, "explore").explore(max_clicks)
 
 
 @mcp.tool()
@@ -146,7 +146,7 @@ def run_steps(window: str, steps: list[str]) -> dict:
 def run_goal(window: str, goal: str, max_steps: int = 12) -> dict:
     """Hand the task to Jev. This is the call to make. Jev sees the controls and picks each click.
 
-    Do not take a screenshot, do not call describe first, and do not open the log images.
+    Do not take a screenshot, and do not call describe first.
     Returns status "done", a "stopped: ..." reason, or "needs_text". On needs_text, call
     provide_text with the text the task asked for; the same run continues. The result is
     text (the actions Jev took), not an image.

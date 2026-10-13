@@ -25,7 +25,6 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from ctypes import wintypes
-from datetime import datetime
 from pathlib import Path
 
 try:
@@ -33,9 +32,8 @@ try:
 except OSError:
     pass
 
-from PIL import Image, ImageChops, ImageDraw, ImageFont
+from PIL import Image, ImageChops
 
-RUNS = Path(os.environ.get("WINDOWS_JEV_LOGS") or Path.home() / "windows_jev_runs")
 LIBRARY = Path(os.environ.get("WINDOWS_JEV_LIBRARY") or Path.home() / "windows_jev_library")
 JEV_HOST = "api.typesafe.ai"
 JEV_MODEL = "jev-1.13.0"
@@ -49,7 +47,6 @@ CONFIDENT = 0.4
 # A window with fewer named controls than this is treated as opaque to UI Automation.
 UIA_MIN_CONTROLS = 8
 user32 = ctypes.windll.user32
-_log_pool = ThreadPoolExecutor(max_workers=1)
 
 
 # ---------------------------------------------------------------- windows
@@ -993,7 +990,7 @@ _vision: tuple | None = None  # (YOLOv9 detector, OCR language) once a window ne
 class Session:
     """One goal on one window. advance() runs until done, out of steps, or text is needed."""
 
-    def __init__(self, window: str, goal: str, max_steps: int = 12, log: bool = True):
+    def __init__(self, window: str, goal: str, max_steps: int = 12):
         match = [(h, t) for h, t in enum_windows() if window.lower() in t.lower()]
         if not match:
             raise ValueError(f"no visible window title contains {window!r}")
@@ -1013,11 +1010,9 @@ class Session:
         self.dead: set[str] = set()
         self.typed: set[str] = set()
         self.records: list[dict] = []
-        self.frames: list[tuple] = []
         self.step = 0
         self.pending: tuple | None = None
         self.started = time.perf_counter()
-        self.out = RUNS / datetime.now().strftime("%Y%m%d_%H%M%S") if log else None
         self._pool = ThreadPoolExecutor(max_workers=1)
 
     def _read(self, rect, shot_future) -> tuple[list[dict], Image.Image, dict]:
@@ -1065,9 +1060,9 @@ class Session:
                 "target_confidence": target.get("confidence"),
             }
             if done >= DONE_THRESHOLD:
-                return self._finish("done", record, shot, offered, None)
+                return self._finish("done", record)
             if chosen is None:
-                return self._finish("stopped: Jev returned an unknown id", record, shot, offered, None)
+                return self._finish("stopped: Jev returned an unknown id", record)
             if chosen["action"] == "type":
                 self.pending = (chosen, rect, shot, offered, record, t_step)
                 return {
@@ -1079,7 +1074,7 @@ class Session:
                     "next": "Call provide_text with the exact text for this field. Do not take a screenshot.",
                 }
             self._act(chosen, rect, shot, offered, record, t_step, None, False)
-        return self._finish("stopped: step budget spent", None, None, None, None)
+        return self._finish("stopped: step budget spent")
 
     def provide_text(self, text: str, press_enter: bool = False) -> dict:
         if self.pending is None:
@@ -1361,7 +1356,7 @@ class Session:
             if chosen is None:
                 for _ in opened:  # the search opened a menu; put it back
                     tap(0x1B)
-                summary = self._finish(f"stopped: no control found for step {self.step} {steps[index]!r}", record, shot, offered, None)
+                summary = self._finish(f"stopped: no control found for step {self.step} {steps[index]!r}", record)
                 return self._with_screen(summary)
             before_title = self._title() if press_enter else ""
             self._act(chosen, rect, shot, offered, record, t_step, text, press_enter)
@@ -1382,7 +1377,7 @@ class Session:
             # Enter loads another page. Wait here, so the next step of this same call sees it.
             if press_enter:
                 self._wait_navigation(before_title)
-        return self._with_screen(self._finish("done", None, None, None, None))
+        return self._with_screen(self._finish("done"))
 
     def _with_screen(self, summary: dict) -> dict:
         """Final read so the last click is stored in the graph. The caller does not receive the screen."""
@@ -1436,14 +1431,12 @@ class Session:
         if text is None:
             record["step_ms"] = round((time.perf_counter() - t_step) * 1000, 1)
         self.records.append(record)
-        self.frames.append((record["step"], shot, offered, chosen))
 
-    def _finish(self, status, record, shot, offered, chosen) -> dict:
+    def _finish(self, status, record=None) -> dict:
         self.lib.save()
         if record is not None:
             record["action"] = status
             self.records.append(record)
-            self.frames.append((record["step"], shot, offered, chosen))
         summary = {
             "status": status,
             "window": self.title,
@@ -1461,84 +1454,7 @@ class Session:
             ],
             "note": "Jev drove these clicks. Do not take a screenshot or open an image.",
         }
-        if self.out is not None:
-            logged = dict(summary)
-            logged["log"] = str(self.out)
-            final = grab(window_rect(self.hwnd))
-            _log_pool.submit(self._write, final, logged)
         return summary
-
-    def _write(self, final: Image.Image, summary: dict) -> None:
-        self.out.mkdir(parents=True, exist_ok=True)
-        # Fast PNG compression: the logs are written while the next call may already be running.
-        final.save(self.out / "final.png", compress_level=1)
-        for step, shot, offered, chosen in self.frames:
-            shot.save(self.out / f"step{step}_screen.png", compress_level=1)
-            draw(shot, offered, chosen).save(self.out / f"step{step}_candidates.png", compress_level=1)
-        records = {r["step"]: r for r in self.records}
-        for step, _shot, offered, _chosen in self.frames:
-            (self.out / f"step{step}.json").write_text(
-                json.dumps({"record": records.get(step), "offered": offered}, indent=2), encoding="utf-8"
-            )
-        summary["steps"] = self.records
-        (self.out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-        write_readme(self.out, summary)
-
-
-# ---------------------------------------------------------------- logs
-
-
-def font(size: int):
-    for name in ("segoeui.ttf", "arial.ttf"):
-        try:
-            return ImageFont.truetype(name, size)
-        except OSError:
-            continue
-    return ImageFont.load_default()
-
-
-def draw(image: Image.Image, offered: list[dict], chosen: dict | None) -> Image.Image:
-    marked = image.convert("RGB")
-    pen = ImageDraw.Draw(marked)
-    face = font(13)
-    for item in offered:
-        if item.get("action") == "type":
-            continue
-        color = {"text": "red", "icon": "deepskyblue"}.get(item["kind"], "orange")
-        pen.rectangle((item["x1"], item["y1"], item["x2"], item["y2"]), outline=color, width=1)
-        pen.text((item["x1"], max(0, item["y1"] - 13)), item["id"], fill=color, font=face)
-    if chosen:
-        box = (chosen["x1"] - 3, chosen["y1"] - 3, chosen["x2"] + 3, chosen["y2"] + 3)
-        pen.rectangle(box, outline="lime", width=4)
-        verb = "TYPE INTO" if chosen.get("action") == "type" else "CLICK"
-        pen.text((chosen["x1"], max(0, chosen["y1"] - 28)), f"{verb} {chosen['text']}", fill="lime", font=font(20))
-    return marked
-
-
-def write_readme(out: Path, summary: dict) -> None:
-    rows = [
-        "# Agent run",
-        "",
-        f"Window: {summary['window']}",
-        f"Goal: {summary['goal']}",
-        f"Result: {summary['status']} in {summary['total_ms']} ms",
-        "",
-        "| Step | Source | Read UI | Jev | Start to decision | Wait for screen | Action |",
-        "|---:|---|---:|---:|---:|---:|---|",
-    ]
-    for r in summary["steps"]:
-        rows.append(
-            f"| {r['step']} | {r.get('source')} | {r.get('read_ms')} | {r.get('jev_ms')} | {r.get('think_ms')} | "
-            f"{r.get('settle_ms', '')} | {r.get('action')} (done p={r.get('done_probability')}) |"
-        )
-    rows += [
-        "",
-        "All times are ms. Source `uia` is one cached UI Automation read; `vision` is YOLOv9 + OCR, used only",
-        "when the window exposes fewer than 8 named controls. `stepN_screen.png` is the raw window,",
-        "`stepN_candidates.png` shows what Jev could pick (orange = UI Automation, red = OCR text,",
-        "blue = YOLOv9 icon, green = chosen). `stepN.json` has every option Jev saw.",
-    ]
-    (out / "README.md").write_text("\n".join(rows) + "\n", encoding="utf-8")
 
 
 # ---------------------------------------------------------------- check
@@ -1818,16 +1734,12 @@ def main() -> None:
         sys.stdout.write("".join(title + "\n" for _hwnd, title in enum_windows()))
         return
     if args.cmd == "describe":
-        _emit(Session(args.window, "", log=False).describe())
+        _emit(Session(args.window, "").describe())
         return
     if args.cmd == "goal":
-        result = Session(args.window, " ".join(args.task)).advance()
-        _log_pool.shutdown(wait=True)
-        _emit(result)
+        _emit(Session(args.window, " ".join(args.task)).advance())
         return
-    result = Session(args.window, " ; ".join(args.step)).run_plan(args.step)
-    _log_pool.shutdown(wait=True)
-    _emit(result)
+    _emit(Session(args.window, " ; ".join(args.step)).run_plan(args.step))
 
 
 if __name__ == "__main__":
