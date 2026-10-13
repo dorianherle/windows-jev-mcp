@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
 .venv/
+build/
+*.egg-info/
 windows_jev_runs/
 .env

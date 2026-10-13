@@ -1,0 +1,22 @@
+[project]
+name = "windows-jev-mcp"
+version = "0.1.0"
+description = "Click Windows UI from the terminal, or from an editor that has MCP."
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.23,<2",
+    "comtypes>=1.4",
+    "mss>=10.0",
+    "pillow>=11.0",
+]
+
+[project.scripts]
+windows-jev = "win_agent:main"
+windows-jev-mcp = "windows_jev_mcp:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["win_agent", "windows_jev_mcp", "fast_detect"]

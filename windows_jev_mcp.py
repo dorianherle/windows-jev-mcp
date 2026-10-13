@@ -162,5 +162,9 @@ def provide_text(text: str, press_enter: bool = False) -> dict:
     return _worker.submit(_session.provide_text, text, press_enter).result()
 
 
-if __name__ == "__main__":
+def main() -> None:
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

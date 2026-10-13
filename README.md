@@ -12,44 +12,50 @@ If a name is not on screen, [Jev](https://typesafe.ai) picks the control. A miss
 
 ## Paste this to install it
 
-Give this to an agent. It sets the server up and does not touch any app.
+Give this to an agent. It installs the command and does not click anything.
 
 ```
-Install windows-jev-mcp on this machine and stop when it is ready. Do not open or click any app.
+Install windows-jev on this Windows machine with uv. Do not open or click any app.
 
-- Clone https://github.com/dorianherle/windows-jev-mcp.git
-- Use Python 3.11 or newer. Run pip install -r requirements.txt
-- Run python win_agent.py --check. It must print "self-check ok".
-- Ask me for a TypeSafe API key. Write it only as TYPESAFE_API_KEY=... in a .env file next to win_agent.py. That file is gitignored. Never commit the key and never print it.
-- Register an MCP server named windows-jev that launches windows_jev_mcp.py with this Python. In Cursor, that goes in ~/.cursor/mcp.json.
-- Tell me to restart the MCP server, then stop.
+- If uv is missing, install it with: powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+- Run: uv tool install git+https://github.com/dorianherle/windows-jev-mcp.git
+- Open a new terminal if windows-jev is not found.
+- windows-jev check must print "self-check ok".
+- Ask me for a TypeSafe API key. Set the user environment variable TYPESAFE_API_KEY. Never print the key and never commit it.
+- If this editor has MCP, register the command windows-jev-mcp and tell me to reload. Cursor: ~/.cursor/mcp.json, key mcpServers. VS Code: user mcp.json, key servers, with "type": "stdio".
+- If this editor has no MCP, stop. The command windows-jev works in the terminal.
 ```
 
-Windows 10 or 11. A key from [typesafe.ai](https://typesafe.ai) is only used when a button name is not already visible.
+That is the whole install. Windows 10 or 11. A key from [typesafe.ai](https://typesafe.ai) is only used when a button name is not already on screen.
 
-The Cursor config looks like this:
+Cursor, if it has MCP:
 
 ```json
 {
   "mcpServers": {
-    "windows-jev": {
-      "command": "C:\\path\\to\\python.exe",
-      "args": ["C:\\path\\to\\windows-jev-mcp\\windows_jev_mcp.py"]
-    }
+    "windows-jev": { "command": "windows-jev-mcp" }
   }
 }
 ```
 
-## The same clicks, as a call
+VS Code, if it has MCP:
 
-Calculator has to be open. The agent then calls:
-
-```text
-describe("Calculator")
-run_steps("Calculator", ["One", "Two", "Plus", "Seven", "Equals"])
+```json
+{
+  "servers": {
+    "windows-jev": { "type": "stdio", "command": "windows-jev-mcp" }
+  }
+}
 ```
 
-`describe` only looks. `run_steps` moves the pointer through the list. The result should say `Display is 19`.
+No MCP, same tool, from the terminal. Calculator has to be open:
+
+```text
+windows-jev describe Calculator
+windows-jev run Calculator One Two Plus Seven Equals
+```
+
+`describe` only looks. `run` moves the pointer. The result should say `Display is 19`. An editor with MCP calls the same thing as `describe` and `run_steps`.
 
 | | |
 |---|---|
@@ -75,13 +81,11 @@ flowchart LR
 
 A path that worked once is saved in `~/windows_jev_library` and skipped past Jev next time.
 
-| Tool | For |
+| In the terminal | In an editor with MCP |
 |---|---|
-| `list_windows()` | Window titles |
-| `describe(window)` | Buttons and fields, no clicks |
-| `run_steps(window, steps)` | The test |
-| `run_goal(window, goal)` | Let Jev pick every click. Slower |
-| `provide_text(text)` | Answer when `run_goal` asks what to type |
-| `show_graph(app)` | The learned paths, as a page |
+| `windows-jev windows` | `list_windows` |
+| `windows-jev describe Calculator` | `describe` |
+| `windows-jev run Calculator One Two Plus Seven Equals` | `run_steps` |
+| | `run_goal`, `provide_text`, `show_graph` |
 
 A click under another window is refused. No pixel change within 600 ms means it missed. Jev reads text, up to 250 controls. Apps with no names need the optional vision extra in `requirements-vision.txt`.

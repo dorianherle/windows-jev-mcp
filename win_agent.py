@@ -18,6 +18,7 @@ import json
 import math
 import os
 import re
+import sys
 import threading
 import time
 from collections import deque
@@ -623,7 +624,11 @@ def _dotenv(path: Path, name: str = "TYPESAFE_API_KEY") -> str:
 
 
 def api_key() -> str:
-    key = os.environ.get("TYPESAFE_API_KEY", "").strip() or _dotenv(Path(__file__).with_name(".env"))
+    key = (
+        os.environ.get("TYPESAFE_API_KEY", "").strip()
+        or _dotenv(Path.cwd() / ".env")
+        or _dotenv(Path(__file__).with_name(".env"))
+    )
     if not key:
         import winreg
 
@@ -1667,19 +1672,43 @@ def _self_check() -> None:
     print("self-check ok")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+def _emit(result: dict) -> None:
+    sys.stdout.write(json.dumps(result, indent=2) + "\n")
+    if str(result.get("status", "")).startswith("stopped"):
+        raise SystemExit(1)
+
+
+def main() -> None:
+    """Command line. `check` opens nothing. `run` clicks. MCP is optional."""
+    argv = sys.argv[1:]
+    if not argv or argv == ["--check"] or argv == ["check"]:
+        _self_check()
+        return
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "windows":
+        sys.stdout.write("".join(title + "\n" for _hwnd, title in enum_windows()))
+        return
+    if cmd == "describe" and rest:
+        _emit(Session(rest[0], "", log=False).describe())
+        return
+    if cmd == "run" and len(rest) >= 2:
+        result = Session(rest[0], " ; ".join(rest[1:])).run_plan(rest[1:])
+        _log_pool.shutdown(wait=True)
+        _emit(result)
+        return
+    parser = argparse.ArgumentParser(prog="windows-jev")
     parser.add_argument("--window", default="Calculator")
     parser.add_argument("--goal", default="Use the calculator buttons to compute 12 + 7 and show the result 19")
     parser.add_argument("--steps", type=int, default=12)
-    parser.add_argument("--check", action="store_true")
-    args = parser.parse_args()
-    _self_check()
-    if not args.check:
-        session = Session(args.window, args.goal, args.steps)
-        result = session.advance()
-        while result["status"] == "needs_text":
-            text = input(f"Text for '{result['field']}': ")
-            result = session.provide_text(text)
-        print(json.dumps(result, indent=2))
-        _log_pool.shutdown(wait=True)
+    args = parser.parse_args(argv)
+    session = Session(args.window, args.goal, args.steps)
+    result = session.advance()
+    while result["status"] == "needs_text":
+        text = input(f"Text for '{result['field']}': ")
+        result = session.provide_text(text)
+    _log_pool.shutdown(wait=True)
+    _emit(result)
+
+
+if __name__ == "__main__":
+    main()
