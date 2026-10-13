@@ -18,7 +18,8 @@ def judge(text: str) -> dict[str, bool]:
     return {
         "chipcake": "chipcake" in low or "chip cake" in low,
         "evaporation": "evaporation" in low,
-        "aluminum": re.search(r"material:\s*al\b", low) is not None,
+        # The dropdown keeps the short name "Al". "AlGaAs" and "Allow" are different controls.
+        "aluminum": re.search(r"(?<![a-z0-9])al(?![a-z0-9])", low) is not None,
         "spin_coat": "spin coat" in low,
         "develop": re.search(r"\bdevelop\b", low) is not None,
     }
@@ -113,6 +114,8 @@ def _check() -> None:
     built = judge("ChipCake\nEvaporation\nMaterial: Al\nSpin coat\nDevelop")
     assert built == {name: True for name in CHECKS}
     assert judge("All process steps")["aluminum"] is False
+    assert judge("AlGaAs\nAllow")["aluminum"] is False
+    assert judge("click Al (bottom-left)")["aluminum"] is True
     assert judge("development time")["develop"] is False
     print("score-check ok")
 
