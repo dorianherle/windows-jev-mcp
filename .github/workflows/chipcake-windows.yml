@@ -1,0 +1,46 @@
+name: chipcake on hosted windows
+
+on:
+  push:
+    branches: [chipcake-hosted-windows]
+
+jobs:
+  chipcake:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Open chipcake and click it with windows-jev
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: utf-8
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+        run: |
+          uv venv --python 3.13 .venv
+          uv pip install --python .venv .
+          $jev = ".\.venv\Scripts\windows-jev.exe"
+          & $jev check
+          $edge = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
+          if (-not (Test-Path $edge)) { $edge = "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe" }
+          Start-Process $edge -ArgumentList @('--guest','--no-first-run','--start-maximized','https://chipcake.com')
+          $ready = $false
+          foreach ($i in 1..20) {
+            Start-Sleep -Seconds 3
+            Write-Host "---- windows ----"
+            & $jev windows
+            $desc = & $jev describe chipcake 2>&1 | Out-String
+            Write-Host "---- describe ----"
+            Write-Host $desc
+            if ($desc -match 'Sample device') { $ready = $true; break }
+          }
+          if (-not $ready) { throw "ChipCake controls never appeared" }
+          $failed = $false
+          foreach ($step in @('Sample device','Tutorial','New')) {
+            Write-Host "---- run $step ----"
+            & $jev run chipcake $step 2>&1 | Write-Host
+            if ($LASTEXITCODE -ne 0) { $failed = $true }
+            & $jev describe chipcake 2>&1 | Write-Host
+          }
+          if ($failed) { exit 1 }
