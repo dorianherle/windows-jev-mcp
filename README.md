@@ -33,6 +33,20 @@ That is the whole install. Windows 10 or 11. A key from [typesafe.ai](https://ty
 
 `windows-jev setup` registers the server for whichever editor is installed. When this chat has MCP, a task is `run_goal`: Jev picks the clicks. Copilot Chat in VS Code needs Agent mode. Cursor uses the same tool.
 
+## Paste this to update it
+
+Give this to an agent when windows-jev is already installed. It replaces the tool and does not click anything.
+
+```
+Update windows-jev on this Windows machine. Do not open or click any app.
+
+- Run: uv tool install --force --reinstall git+https://github.com/dorianherle/windows-jev-mcp.git
+- A reinstall replaces the tool environment. If a window has no control names, install the vision extra again or MCP fails with "No module named numpy". Run:
+  uv pip install --python "$(uv tool dir)\windows-jev-mcp\Scripts\python.exe" --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple numpy torch torchvision "openvino>=2025.0" huggingface_hub "winocr>=0.0.15"
+- windows-jev check must print "self-check ok".
+- Reload the editor so it restarts windows-jev. Do not take a screenshot.
+```
+
 ## Paste this to use it
 
 Replace the first line with the task. Leave the instructions under it.
