@@ -1,16 +1,64 @@
 # windows-jev-mcp
 
-Yes, you can use it. It is an MCP server that clicks and types in real Windows apps.
+An MCP server that **clicks and types in Windows apps** for you.
 
-You name the steps. The server finds each control on screen and does it. A step that matches a visible name does not call a model. When the name is only a description ("Evaporation" for a long button), it still matches if that button is the only one. [Jev](https://typesafe.ai) is used only when the name is not on screen.
+You name the buttons. It finds them on the real window and presses them. If the name is already on screen, it does not call a model. [Jev](https://typesafe.ai) is only asked when the control is not obvious.
 
-A full unknown-UI pass is in this repo: Chrome opened [chipcake.com](https://chipcake.com), added evaporation of Al, spin coat, and develop. Score **5/5** in **14.7 s**, with no Jev call. Calculator `1 + 1` is under a second.
+```mermaid
+flowchart LR
+  A["You: click Plus"] --> B["Read the window"]
+  B --> C{"Name on screen?"}
+  C -->|Yes| D["Click it"]
+  C -->|No| E["Jev picks the control"]
+  E --> D
+```
 
-It will not click Send, Delete, or similar names while it is searching for a control. Do not point it at those unless you mean it.
+It refuses a click that would land on a different window. While it is searching, it will not press Send, Delete, or Close. Name those steps yourself only when you mean them.
+
+## Test an app
+
+The app has to be open. Then four calls:
+
+```mermaid
+flowchart TD
+  A["1. App window is open"] --> B["2. list_windows"]
+  B --> C["3. describe"]
+  C --> D["4. run_steps"]
+  D --> E["5. Read the score"]
+```
+
+`describe` only looks. `run_steps` does the clicks.
+
+```text
+list_windows()
+describe("Calculator")
+run_steps("Calculator", ["1", "Plus", "1", "Equals"])
+```
+
+A pass is: the result text contains `2`.
+
+| | What to report |
+|---|---|
+| **total** | How many things you checked |
+| **time** | `total_ms` from the result |
+| **log** | `status`, each step, and the screenshot folder |
+| **score** | How many checks are true |
+
+Screenshots are saved under `~/windows_jev_runs`. `stepN_screen.png` is the window just before that click.
+
+Typing works the same way. One step can be:
+
+```text
+type "https://example.com" into Address and press enter
+```
+
+The steps after Enter already see the new page. Keep them in the same `run_steps` list.
+
+If `status` starts with `stopped:`, that one name was not on screen. Call `describe` again and fix that step. If `screen_changed` is false, the click did not land.
 
 ## Install
 
-Windows 10/11, Python 3.11+.
+Windows 10 or 11, Python 3.11 or newer.
 
 ```powershell
 git clone https://github.com/dorianherle/windows-jev-mcp.git
@@ -19,17 +67,17 @@ python -m pip install -r requirements.txt
 python win_agent.py --check
 ```
 
-`self-check ok` means the install is fine. No window is opened.
+You want the line `self-check ok`. That check does not open a window.
 
-Put your TypeSafe key in a file named `.env` next to `win_agent.py`:
+A TypeSafe key is needed only when a button name is not already visible. Put it in `.env` next to `win_agent.py` (this file is never committed):
 
 ```
 TYPESAFE_API_KEY=your-key-here
 ```
 
-That file is gitignored. Never commit it. A key from [typesafe.ai](https://typesafe.ai) is only needed when a control name is not already on screen.
+Get a key at [typesafe.ai](https://typesafe.ai).
 
-Cursor: `~/.cursor/mcp.json`
+In Cursor, add this to `~/.cursor/mcp.json`, then restart the MCP server:
 
 ```json
 {
@@ -42,88 +90,58 @@ Cursor: `~/.cursor/mcp.json`
 }
 ```
 
-Restart the MCP server in the client after you change this. The key can also go in that `env` block, or in the Windows user variable `TYPESAFE_API_KEY`.
+The key can live in that file under `env` instead of `.env`.
 
-## Prompt for an agent
-
-Paste this to the agent that should wire it up and test an app:
+## Prompt to give an agent
 
 ```
-Set up https://github.com/dorianherle/windows-jev-mcp and use it to test a Windows app by clicking its real UI.
+Set up https://github.com/dorianherle/windows-jev-mcp and test a Windows app by clicking its real UI.
 
 Install
-- Windows 10/11, Python 3.11+.
-- Clone the repo, pip install -r requirements.txt, run python win_agent.py --check. Stop if it does not print "self-check ok".
-- Ask me for a TypeSafe API key if .env is missing. Write it only to a gitignored .env next to win_agent.py as TYPESAFE_API_KEY=... Never commit that file, never print the key.
-- Register windows_jev_mcp.py as an MCP server named windows-jev. Restart that server before the first test.
+- Windows 10/11 and Python 3.11+.
+- Clone the repo, pip install -r requirements.txt, run python win_agent.py --check.
+- Stop if it does not print "self-check ok".
+- If .env is missing, ask me for a TypeSafe key. Write only TYPESAFE_API_KEY=... into a gitignored .env next to win_agent.py. Never commit it and never print it.
+- Register windows_jev_mcp.py as an MCP server named windows-jev, then restart that server.
 
-Test the app through its UI
-1. Launch the app, or use a window that is already open. Take a unique part of the window title from list_windows.
-2. Call describe(window). It does not click. Read buttons, fields, and screen_text. Plan from those names.
-3. Call run_steps once with a short list. Each step is a control name ("+ add step", "Seven") or: type "the text" into Field name and press enter. Use the shortest unique name. After Enter, the next steps in the same list already see the new page.
-4. Do not click Send, Delete, pay, submit, or close unless I explicitly asked for that step.
-5. Score the return value and show me all four:
-   - total: how many checks you defined
-   - time: total_ms from the result
-   - log: status, the steps list, and the screenshot folder (log)
-   - score: how many checks are true in buttons, fields, screen_text, and step actions
-6. If status starts with "stopped:", that one control was not on screen. describe again and replace that step. Do not wander off into a different page.
-7. A click with screen_changed false did not land. Say so.
+Test
+1. Use a window that is already open, or launch the app. Pick the title from list_windows.
+2. describe(window) does not click. Read buttons, fields, and screen_text before you plan.
+3. run_steps(window, steps) once. A step is a control name ("Seven") or: type "the text" into Field name and press enter.
+4. Do not click Send, Delete, pay, submit, or close unless I asked for that step.
+5. Show me total, time (total_ms), log (status, steps, screenshot folder), and score.
+6. If status starts with "stopped:", describe again and replace that one step.
+7. If screen_changed is false, the click missed. Say so.
 
-Example pass: window "Calculator", steps ["1", "Plus", "1", "Equals"]. The check passes when the result text contains "2".
+Calculator example: window "Calculator", steps ["1", "Plus", "1", "Equals"]. Pass when the result contains "2".
 ```
 
-## Test an app yourself
+## How a step is chosen
 
-Open the app so its window is visible.
-
-```text
-list_windows()
-describe("Calculator")
-run_steps("Calculator", ["1", "Plus", "1", "Equals"])
+```mermaid
+flowchart LR
+  A["Exact name"] --> B["Same name, longer label"]
+  B --> C["Path learned earlier"]
+  C --> D["One Jev call"]
 ```
 
-`describe` only reads. `run_steps` clicks the whole list in one call. A URL can be one step: `type "https://example.com" into Address and press enter`.
-
-Judge the result:
-
-| Field | Meaning |
-|---|---|
-| total | Number of checks you care about |
-| time | `total_ms` on the result |
-| log | `status`, each step's `action`, and the `log` folder of screenshots |
-| score | How many checks show up in `buttons`, `fields`, `screen_text`, or the step actions |
-
-Screenshots land in `~/windows_jev_runs` (or `WINDOWS_JEV_LOGS`). `stepN_screen.png` is the window before that click.
-
-The ChipCake test in this repo is the same idea, scored automatically:
-
-```powershell
-python chipcake_test.py
-```
-
-It opens Chrome, builds the stack, and writes `chipcake_result.json` with `total`, `time`, `log`, and `score`. It clicks the live desktop, so run it on a machine you can spare. `python chipcake_test.py --check` only checks the scorer.
+Jev may answer "none". A weak guess is dropped, so a missing button is not clicked at random. A path that worked once is remembered in `~/windows_jev_library` and reused with no model call.
 
 ## Tools
 
-| Tool | What it does |
+| Tool | Use it for |
 |---|---|
-| `list_windows()` | Visible window titles. |
-| `describe(window)` | Buttons, fields, screen text. No clicks. |
-| `run_steps(window, steps)` | Click and type a plan. This is the one to use. |
-| `run_goal(window, goal)` | Let Jev pick every click. Slower. Use `run_steps` when you can name the controls. |
-| `provide_text(text)` | Continue a `run_goal` that stopped to ask what to type. |
-| `explore(window)` | Click tabs only, to learn the app. Skips Send, Delete, Close. |
-| `show_graph(app)` | Open the learned click-paths as a page. |
-| `edit_graph(...)` | Fix a learned path. |
-
-A step is resolved in order: exact name, unique longer name, a path learned from an earlier click, then one Jev call. Jev may answer "none". Low-confidence picks are dropped, so a missing control is not clicked as a guess.
-
-Learned paths are saved per app in `~/windows_jev_library`.
+| `list_windows()` | See window titles |
+| `describe(window)` | Read buttons and fields. No clicks |
+| `run_steps(window, steps)` | Run the test. Start here |
+| `run_goal(window, goal)` | Let Jev choose every click. Slower |
+| `provide_text(text)` | Answer `run_goal` when it asks what to type |
+| `explore(window)` | Click tabs only, to learn the app |
+| `show_graph(app)` | Open the learned paths as a page |
+| `edit_graph(...)` | Correct a learned path |
 
 ## Limits
 
-- Another window covering the button refuses the click.
-- A click that changes no pixels within 600 ms is marked dead (`screen_changed: false`).
-- Jev sees at most 250 controls, and it sees text, not bare icons.
-- Apps with no UI Automation names need the optional vision extra (`requirements-vision.txt` and [OmniParser](https://github.com/microsoft/OmniParser)). The detector weights are AGPL. Check that license before redistributing them.
+- A button hidden under another window is not clicked.
+- No pixel change within 600 ms means the click missed.
+- Jev reads text, up to 250 controls. Bare icons need the optional vision extra in `requirements-vision.txt` ([OmniParser](https://github.com/microsoft/OmniParser), AGPL weights).
