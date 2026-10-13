@@ -1640,6 +1640,7 @@ def _self_check() -> None:
         saved = json.loads(cfg.read_text(encoding="utf-8"))
         assert saved["mcpServers"]["other"]["command"] == "keep"
         assert saved["mcpServers"]["windows-jev"]["env"]["TYPESAFE_API_KEY"] == "secret"
+    assert _mcp_line([]) == "mcp: none" and _mcp_line(["cursor", "vscode"]) == "mcp: cursor,vscode"
     blank = Image.new("L", (4, 4), 0)
     flick = blank.copy()
     flick.putpixel((0, 0), 1)
@@ -1713,6 +1714,23 @@ def _key_or_blank() -> str:
         return ""
 
 
+def _mcp_line(names: list[str]) -> str:
+    return "mcp: " + (",".join(names) if names else "none")
+
+
+def _mcp_clients() -> list[str]:
+    """Editors on this machine that can load an MCP server."""
+    found = []
+    if (Path.home() / ".cursor").is_dir():
+        found.append("cursor")
+    appdata = os.environ.get("APPDATA", "")
+    if appdata and (Path(appdata) / "Code" / "User").is_dir():
+        found.append("vscode")
+    if appdata and (Path(appdata) / "Code - Insiders" / "User").is_dir():
+        found.append("vscode-insiders")
+    return found
+
+
 def register_mcp(path: Path, key_name: str, command: str, api: str = "") -> None:
     """Add the windows-jev server to an editor config. Other servers are left in place."""
     data: dict = {}
@@ -1779,7 +1797,7 @@ def main() -> None:
         for path in setup_editors():
             sys.stdout.write(path + "\n")
         sys.stdout.write("key: already set\n" if _key_or_blank() else "key: missing\n")
-        sys.stdout.write("Reload VS Code. In Copilot Chat, choose Agent, and allow windows-jev.\n")
+        sys.stdout.write(_mcp_line(_mcp_clients()) + "\n")
         return
     if cmd == "windows":
         sys.stdout.write("".join(title + "\n" for _hwnd, title in enum_windows()))
