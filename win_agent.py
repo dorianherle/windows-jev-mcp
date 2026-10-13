@@ -59,6 +59,23 @@ def _cloaked(hwnd: int) -> bool:
     return not ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(value), 4) and bool(value.value)
 
 
+def app_windows(pid: int, skip: int = 0) -> list[int]:
+    """Visible top-level windows of this process, including untitled menus and popups."""
+    found = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    def callback(hwnd, _lparam):
+        if int(hwnd) != skip and user32.IsWindowVisible(hwnd) and not _cloaked(hwnd):
+            owner = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            if owner.value == pid:
+                found.append(int(hwnd))
+        return True
+
+    user32.EnumWindows(callback, 0)
+    return found[:8]
+
+
 def enum_windows() -> list[tuple[int, str]]:
     found = []
 
@@ -361,15 +378,61 @@ def uia_candidates(hwnd: int, rect: tuple[int, int, int, int]) -> list[dict]:
     return out
 
 
+def _scroll_into_view(element, U) -> None:
+    try:
+        pattern = element.GetCurrentPattern(U.UIA_ScrollItemPatternId)
+        if pattern:
+            pattern.QueryInterface(U.IUIAutomationScrollItemPattern).ScrollIntoView()
+    except Exception:
+        return
+
+
+def _named_click(element, U, rect) -> dict | None:
+    """Exact-name hit the list filters out: menu text, a custom row, or an offscreen option."""
+    import comtypes
+
+    left, top, right, bottom = rect
+    try:
+        if not element.CurrentIsEnabled:
+            return None
+        if element.CurrentIsOffscreen:
+            _scroll_into_view(element, U)
+        name = (element.CurrentName or "").strip()[:60]
+        box = element.CurrentBoundingRectangle
+        kind = element.CurrentControlType
+    except (comtypes.COMError, AttributeError):
+        return None
+    if not name or box.right <= box.left or box.bottom <= box.top:
+        return None
+    # Keep the raw box. A menu row can sit outside the window rect we clipped to.
+    x1, y1 = box.left - left, box.top - top
+    x2, y2 = box.right - left, box.bottom - top
+    label = f"{name} ({_region((x1 + x2) / 2, (y1 + y2) / 2, right - left, bottom - top)})"
+    return {
+        "text": name, "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+        "kind": "uia", "ctype": kind, "editable": False, "label": label,
+    }
+
+
 def uia_find(hwnd: int, rect: tuple[int, int, int, int], name: str) -> dict | None:
-    """First control with this exact name. A hit near the top does not walk the rest of the page."""
+    """First control with this exact name. A hit near the top does not walk the rest of the page.
+
+    A menu option Chrome exposes as text, a custom row, or an offscreen item is still a hit:
+    the caller asked for that name.
+    """
     if not name:
         return None
     U, client, request, _condition = _ensure_uia()
-    element = client.ElementFromHandle(hwnd).FindFirstBuildCache(
-        U.TreeScope_Descendants, client.CreatePropertyCondition(U.UIA_NamePropertyId, name), request
-    )
-    return _pack(element, U, rect) if element else None
+    root = client.ElementFromHandle(hwnd)
+    condition = client.CreatePropertyCondition(U.UIA_NamePropertyId, name)
+    element = root.FindFirstBuildCache(U.TreeScope_Descendants, condition, request)
+    if not element:
+        return None
+    item = _pack(element, U, rect)
+    if item is not None and item["kind"] != "uia_text":
+        return item
+    live = root.FindFirst(U.TreeScope_Descendants, condition)
+    return _named_click(live, U, rect) if live else None
 
 
 def set_value(x: int, y: int, text: str) -> bool:
@@ -730,6 +793,15 @@ def lookup(target: str, action: str, offered: list[dict]) -> dict | None:
             ]
             if len(prefixed) == 1:
                 return prefixed[0]
+        # "Evaporation" is the one button "Evaporation near-normal line-of-sight PVD".
+        # Risky words stay exact: "Delete" must not hit "Delete all".
+        if len(wanted) >= 4 and not _RISKY.search(wanted):
+            described = [
+                c for c in offered
+                if c["action"] == action and _norm(c["text"]).startswith(wanted + " ")
+            ]
+            if len(described) == 1:
+                return described[0]
     return None
 
 
@@ -1009,22 +1081,32 @@ class Session:
             self.hwnd, self.title = front, buffer.value
 
     def _spot(self, name: str, action: str):
-        """The control with this exact name, without listing the rest of the page."""
+        """The control with this exact name, without listing the rest of the page.
+
+        Menus and dropdowns are often a second window of the same process, sometimes untitled.
+        """
         self._follow()
         if user32.IsIconic(self.hwnd):
             focus(self.hwnd)
             time.sleep(0.3)
-        rect = window_rect(self.hwnd)
+        hwnds = [self.hwnd]
+        if self.own_pid:
+            hwnds.extend(app_windows(self.own_pid, self.hwnd))
         t0 = time.perf_counter()
-        item = uia_find(self.hwnd, rect, name)
-        if item is None:
-            return None
-        offered = offer([item], set(), set())
-        chosen = next((c for c in offered if c["action"] == action), None)
-        if chosen is None:
-            return None
-        elapsed = round((time.perf_counter() - t0) * 1000, 1)
-        return rect, [item], grab(rect), {"source": "name", "uia_ms": elapsed, "read_ms": elapsed}, offered, chosen
+        for hwnd in hwnds:
+            rect = window_rect(hwnd)
+            if rect[2] <= rect[0] or rect[3] <= rect[1]:
+                continue
+            item = uia_find(hwnd, rect, name)
+            if item is None:
+                continue
+            offered = offer([item], set(), set())
+            chosen = next((c for c in offered if c["action"] == action), None)
+            if chosen is None:
+                continue
+            elapsed = round((time.perf_counter() - t0) * 1000, 1)
+            return rect, [item], grab(rect), {"source": "name", "uia_ms": elapsed, "read_ms": elapsed}, offered, chosen
+        return None
 
     def _look(self):
         """Read the front window of the app and record what the last click revealed."""
@@ -1144,9 +1226,11 @@ class Session:
                 })
                 continue
             spotted = self._spot(wanted, action)
-            # A click just opened this control (Search -> the search box). Poll the name;
-            # listing every link on the page is the slow way to notice it.
-            if spotted is None and self._just_clicked:
+            # A click just opened this control (Search -> the search box, Au -> the Al row).
+            # Poll the exact name; a described button ("Evaporation near-normal...") will not
+            # appear under the short name, so lookup's unique prefix takes it without the wait.
+            token = _norm(wanted)
+            if spotted is None and self._just_clicked and not (len(token) >= 4 and " " not in token and not _RISKY.search(token)):
                 until = time.perf_counter() + 0.8
                 while spotted is None and time.perf_counter() < until:
                     time.sleep(0.04)
@@ -1208,7 +1292,9 @@ class Session:
                             continue
                     chosen = current
                     by_jev = chosen is not None
-                if chosen is not None or len(opened) >= 2:
+                if chosen is not None or len(opened) >= 2 or len(_norm(target)) <= 3:
+                    # A short label ("Al") is a row in the menu just opened. Guessing a
+                    # navigation control ("Materials") leaves the page.
                     break
                 opener, ms = ask_opener(target, offered, screen_text(candidates), self.goal, self.history, opened)
                 jev_ms += ms
@@ -1500,6 +1586,10 @@ def _self_check() -> None:
     assert lookup("Clear", "click", [entry, {**entry, "text": "Clear history"}])["text"] == "Clear entry"
     assert lookup("Clear", "click", [entry, {**entry, "text": "Clear button"}]) is None
     assert lookup("Delete", "click", [{**entry, "text": "Delete all"}]) is None
+    evap = {**entry, "text": "Evaporation near-normal line-of-sight PVD"}
+    assert lookup("Evaporation", "click", [evap, {**entry, "text": "Spin coat resist coating"}])["text"] == evap["text"]
+    assert lookup("Al", "click", [{**entry, "text": "AlGaAs"}, {**entry, "text": "AlN"}]) is None
+    assert lookup("Evaporation", "click", [evap, {**evap, "text": "Evaporation of gold"}]) is None
     blank = Image.new("L", (4, 4), 0)
     flick = blank.copy()
     flick.putpixel((0, 0), 1)
