@@ -170,9 +170,20 @@ def type_text(text: str) -> None:
         time.sleep(0.005)
 
 
+def bring_onscreen(hwnd: int) -> None:
+    """Maximize a window whose center is off the desktop. A restored Chrome can open below the screen."""
+    left, top, right, bottom = window_rect(hwnd)
+    cx, cy = (left + right) // 2, (top + bottom) // 2
+    vx, vy = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)
+    vw, vh = user32.GetSystemMetrics(78), user32.GetSystemMetrics(79)
+    if vw > 0 and vh > 0 and not (vx <= cx < vx + vw and vy <= cy < vy + vh):
+        user32.ShowWindow(hwnd, 3)
+
+
 def focus(hwnd: int) -> None:
     # Sharing the foreground thread's input state lets SetForegroundWindow succeed
     # without a synthetic Alt tap, which would put the app into menu-shortcut mode.
+    bring_onscreen(hwnd)
     foreground = user32.GetForegroundWindow()
     if foreground == hwnd:
         return
@@ -387,38 +398,55 @@ def _scroll_into_view(element, U) -> None:
         return
 
 
-def _named_click(element, U, rect) -> dict | None:
-    """Exact-name hit the list filters out: menu text, a custom row, or an offscreen option."""
+def _inside(element, U, rect, cached: bool) -> dict | None:
+    """Exact-name control whose box meets this window. Text and custom rows count; offscreen ones do not."""
     import comtypes
 
     left, top, right, bottom = rect
+    width, height = right - left, bottom - top
     try:
-        if not element.CurrentIsEnabled:
-            return None
-        if element.CurrentIsOffscreen:
-            _scroll_into_view(element, U)
-        name = (element.CurrentName or "").strip()[:60]
-        box = element.CurrentBoundingRectangle
-        kind = element.CurrentControlType
+        if cached:
+            name = (element.CachedName or "").strip()[:60]
+            hidden = element.CachedIsOffscreen or not element.CachedIsEnabled
+            box = element.CachedBoundingRectangle
+            kind = element.CachedControlType
+        else:
+            name = (element.CurrentName or "").strip()[:60]
+            hidden = element.CurrentIsOffscreen or not element.CurrentIsEnabled
+            box = element.CurrentBoundingRectangle
+            kind = element.CurrentControlType
     except (comtypes.COMError, AttributeError):
         return None
-    if not name or box.right <= box.left or box.bottom <= box.top:
+    if not name or hidden or width <= 0 or height <= 0:
         return None
-    # Keep the raw box. A menu row can sit outside the window rect we clipped to.
-    x1, y1 = box.left - left, box.top - top
-    x2, y2 = box.right - left, box.bottom - top
-    label = f"{name} ({_region((x1 + x2) / 2, (y1 + y2) / 2, right - left, bottom - top)})"
+    if box.right <= left or box.left >= right or box.bottom <= top or box.top >= bottom:
+        return None
+    x1, y1 = max(0, box.left - left), max(0, box.top - top)
+    x2, y2 = min(width, box.right - left), min(height, box.bottom - top)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    label = f"{name} ({_region((x1 + x2) / 2, (y1 + y2) / 2, width, height)})"
     return {
         "text": name, "x1": x1, "y1": y1, "x2": x2, "y2": y2,
         "kind": "uia", "ctype": kind, "editable": False, "label": label,
     }
 
 
-def uia_find(hwnd: int, rect: tuple[int, int, int, int], name: str) -> dict | None:
-    """First control with this exact name. A hit near the top does not walk the rest of the page.
+def _named_click(element, U, rect) -> dict | None:
+    """Scroll an offscreen exact-name row into this window, then keep it only if it landed inside."""
+    try:
+        if element.CurrentIsOffscreen:
+            _scroll_into_view(element, U)
+    except Exception:
+        return None
+    return _inside(element, U, rect, cached=False)
 
-    A menu option Chrome exposes as text, a custom row, or an offscreen item is still a hit:
-    the caller asked for that name.
+
+def uia_find(hwnd: int, rect: tuple[int, int, int, int], name: str) -> dict | None:
+    """First on-screen control with this exact name. A hit near the top does not walk the rest of the page.
+
+    Menu text and custom rows count. An offscreen copy of the same name is not clicked: the last
+    run hit '+ add step' at y=1427, off the desktop, and the click was refused.
     """
     if not name:
         return None
@@ -431,6 +459,11 @@ def uia_find(hwnd: int, rect: tuple[int, int, int, int], name: str) -> dict | No
     item = _pack(element, U, rect)
     if item is not None and item["kind"] != "uia_text":
         return item
+    found = root.FindAllBuildCache(U.TreeScope_Descendants, condition, request)
+    for index in range(found.Length):
+        item = _inside(found.GetElement(index), U, rect, cached=True)
+        if item is not None:
+            return item
     live = root.FindFirst(U.TreeScope_Descendants, condition)
     return _named_click(live, U, rect) if live else None
 
@@ -1086,6 +1119,7 @@ class Session:
         Menus and dropdowns are often a second window of the same process, sometimes untitled.
         """
         self._follow()
+        bring_onscreen(self.hwnd)
         if user32.IsIconic(self.hwnd):
             focus(self.hwnd)
             time.sleep(0.3)
@@ -1111,6 +1145,7 @@ class Session:
     def _look(self):
         """Read the front window of the app and record what the last click revealed."""
         self._follow()
+        bring_onscreen(self.hwnd)
         if user32.IsIconic(self.hwnd):  # a minimized window has no layout to read
             focus(self.hwnd)
             time.sleep(0.3)
