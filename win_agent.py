@@ -1778,6 +1778,7 @@ def main() -> None:
     if cmd == "setup":
         for path in setup_editors():
             sys.stdout.write(path + "\n")
+        sys.stdout.write("key: already set\n" if _key_or_blank() else "key: missing\n")
         sys.stdout.write("Reload VS Code. In Copilot Chat, choose Agent, and allow windows-jev.\n")
         return
     if cmd == "windows":

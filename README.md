@@ -21,8 +21,9 @@ Install windows-jev on this Windows machine with uv. Do not open or click any ap
 - Run: uv tool install git+https://github.com/dorianherle/windows-jev-mcp.git
 - Open a new terminal if windows-jev is not found.
 - windows-jev check must print "self-check ok".
-- Ask me for a TypeSafe API key. Set the user environment variable TYPESAFE_API_KEY. Never print the key and never commit it.
 - Run: windows-jev setup
+- If that prints "key: already set", do not ask for a key.
+- If that prints "key: missing", ask me for a TypeSafe API key, set the user environment variable TYPESAFE_API_KEY, and run windows-jev setup again. Never print the key and never commit it.
 - Tell me to reload VS Code, open Copilot Chat, choose Agent, and allow the windows-jev tools.
 ```
 
