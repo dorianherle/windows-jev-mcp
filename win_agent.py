@@ -5,8 +5,9 @@ almost no names fall back to YOLOv9 + OCR on a screenshot. Jev only sees
 text labels. When the next step is typing, the session pauses and returns
 `needs_text`; the caller supplies the text with `provide_text`.
 
-    python win_agent.py --window "Calculator" --goal "compute 12 + 7"
-    python win_agent.py --check
+    windows-jev describe Calculator
+    windows-jev run Calculator One Two Plus Seven Equals
+    windows-jev check
 """
 
 from __future__ import annotations
@@ -1641,6 +1642,8 @@ def _self_check() -> None:
         assert saved["mcpServers"]["other"]["command"] == "keep"
         assert saved["mcpServers"]["windows-jev"]["env"]["TYPESAFE_API_KEY"] == "secret"
     assert _mcp_line([]) == "mcp: none" and _mcp_line(["cursor", "vscode"]) == "mcp: cursor,vscode"
+    help_text = _parser().format_help()
+    assert "describe" in help_text and "run" in help_text and "--window" not in help_text
     blank = Image.new("L", (4, 4), 0)
     flick = blank.copy()
     flick.putpixel((0, 0), 1)
@@ -1786,40 +1789,42 @@ def _emit(result: dict) -> None:
         raise SystemExit(1)
 
 
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="windows-jev")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("check", help="print self-check ok and open nothing")
+    sub.add_parser("setup", help="register the editor and report the key")
+    sub.add_parser("windows", help="list open window titles")
+    describe = sub.add_parser("describe", help="list the controls in a window; does not click")
+    describe.add_argument("window", help="part of the window title")
+    run = sub.add_parser("run", help="click these controls, in order")
+    run.add_argument("window", help="part of the window title")
+    run.add_argument("step", nargs="+", help="control names from describe")
+    return parser
+
+
 def main() -> None:
     """Command line. `check` opens nothing. `run` clicks. MCP is optional."""
     argv = sys.argv[1:]
-    if not argv or argv == ["--check"] or argv == ["check"]:
+    if not argv or argv == ["--check"]:
+        argv = ["check"]
+    args = _parser().parse_args(argv)
+    if args.cmd == "check":
         _self_check()
         return
-    cmd, rest = argv[0], argv[1:]
-    if cmd == "setup":
+    if args.cmd == "setup":
         for path in setup_editors():
             sys.stdout.write(path + "\n")
         sys.stdout.write("key: already set\n" if _key_or_blank() else "key: missing\n")
         sys.stdout.write(_mcp_line(_mcp_clients()) + "\n")
         return
-    if cmd == "windows":
+    if args.cmd == "windows":
         sys.stdout.write("".join(title + "\n" for _hwnd, title in enum_windows()))
         return
-    if cmd == "describe" and rest:
-        _emit(Session(rest[0], "", log=False).describe())
+    if args.cmd == "describe":
+        _emit(Session(args.window, "", log=False).describe())
         return
-    if cmd == "run" and len(rest) >= 2:
-        result = Session(rest[0], " ; ".join(rest[1:])).run_plan(rest[1:])
-        _log_pool.shutdown(wait=True)
-        _emit(result)
-        return
-    parser = argparse.ArgumentParser(prog="windows-jev")
-    parser.add_argument("--window", default="Calculator")
-    parser.add_argument("--goal", default="Use the calculator buttons to compute 12 + 7 and show the result 19")
-    parser.add_argument("--steps", type=int, default=12)
-    args = parser.parse_args(argv)
-    session = Session(args.window, args.goal, args.steps)
-    result = session.advance()
-    while result["status"] == "needs_text":
-        text = input(f"Text for '{result['field']}': ")
-        result = session.provide_text(text)
+    result = Session(args.window, " ; ".join(args.step)).run_plan(args.step)
     _log_pool.shutdown(wait=True)
     _emit(result)
 

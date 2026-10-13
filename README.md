@@ -18,15 +18,15 @@ Give this to an agent. It installs the command and does not click anything.
 Install windows-jev on this Windows machine with uv. Do not open or click any app.
 
 - If uv is missing, install it with: powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-- Run: uv tool install git+https://github.com/dorianherle/windows-jev-mcp.git
+- Run: uv tool install --force --reinstall git+https://github.com/dorianherle/windows-jev-mcp.git
 - Open a new terminal if windows-jev is not found.
 - windows-jev check must print "self-check ok".
 - Run: windows-jev setup
 - If that prints "key: already set", do not ask for a key.
 - If that prints "key: missing", ask me for a TypeSafe API key, set the user environment variable TYPESAFE_API_KEY, and run windows-jev setup again. Never print the key and never commit it.
-- If that prints "mcp: none", there is no MCP editor. Use the terminal: windows-jev describe and windows-jev run.
-- If that prints "mcp:" with a name, and this chat can call tools, use the windows-jev tools (describe, run_steps). Tell me to reload that editor and allow windows-jev. In VS Code that is Copilot Chat, Agent mode.
-- If this chat cannot call tools, use the terminal even when an editor is listed.
+- windows-jev --help must list describe and run. Do not run those during install.
+- If setup prints "mcp: none", tell me that later tasks use the terminal: windows-jev describe WINDOW, then windows-jev run WINDOW STEP.
+- If setup prints "mcp:" with a name, tell me to reload that editor and allow windows-jev. In VS Code that is Copilot Chat, Agent mode. After the reload, use the tools. The terminal commands above work either way.
 ```
 
 That is the whole install. Windows 10 or 11. A key from [typesafe.ai](https://typesafe.ai) is only used when a button name is not already on screen.
@@ -43,7 +43,9 @@ Replace the first line with the task. Leave the instructions under it.
 Use windows-jev for the task above. Touch only the app it names.
 
 - If this chat can call the windows-jev tools, call describe on that window, then run_steps with the control names it printed.
-- If it cannot, use the terminal: windows-jev describe <window>, then windows-jev run <window> <step> ...
+- If it cannot, use the terminal. WINDOW is part of the title. Each STEP is a control name from describe:
+  windows-jev describe WINDOW
+  windows-jev run WINDOW STEP STEP
 - Use the names describe printed.
 - Do not click Send, Delete, or Close unless the task names them.
 - To type, use a step like: type "text" into <field> and press enter.
