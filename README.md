@@ -1,14 +1,14 @@
 # windows-jev-mcp
 
-It clicks the buttons on a real Windows app.
+A UI clicking tool for Windows.
 
-You say `One`, `Two`, `Plus`, `Seven`, `Equals`. It presses them. This is that, on Calculator:
+An agent names a control. This server moves the pointer and presses it. Here it is on Calculator, clicking through 12 + 7:
 
-![Calculator going from 0 to 12 + 7 = 19](calculator.gif)
+![Pointer clicking One, then Two, Plus, Seven, and Equals](calculator.gif)
 
-Five clicks, display ends at **19**. Most of those clicks took about 30 ms to decide, because the name was already on the screen. No model call.
+The pointer lands on each key. The display ends at **19**. The clip is slowed down so the pointer is easy to follow. Those clicks were a few tens of milliseconds apart, and none of them asked a model, because the names were already on screen.
 
-If the name is not on screen, [Jev](https://typesafe.ai) picks the control. A missing button is left alone. A click that would hit a different window is refused. Send, Delete, and Close are not pressed while it is searching. You have to name those yourself.
+If a name is not on screen, [Jev](https://typesafe.ai) picks the control. A missing button is left alone. A click that would hit a different window is refused. Send, Delete, and Close are skipped while it is searching. A step has to name them.
 
 ## Paste this to install it
 
@@ -40,16 +40,16 @@ The Cursor config looks like this:
 }
 ```
 
-## Try the same thing
+## The same clicks, as a call
 
-Open Calculator, then:
+Calculator has to be open. The agent then calls:
 
 ```text
 describe("Calculator")
 run_steps("Calculator", ["One", "Two", "Plus", "Seven", "Equals"])
 ```
 
-`describe` only looks. `run_steps` presses the whole list. The result should say `Display is 19`.
+`describe` only looks. `run_steps` moves the pointer through the list. The result should say `Display is 19`.
 
 | | |
 |---|---|
