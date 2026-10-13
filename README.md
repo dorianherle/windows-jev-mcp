@@ -6,10 +6,20 @@ to a control on screen; the server clicks and types.
 
 - The window is read with one cached UI Automation call (`FindAllBuildCache`), typically 30-120 ms.
 - All visible steps are grounded in a single Jev request; the answers are reused until the layout changes.
+- Jev may answer "none", and low-confidence answers are ignored, so a step whose control is not on screen is never
+  clicked on a guess.
 - Text goes into fields through UI Automation `ValuePattern` (about 18 ms), with keystrokes as fallback.
 - Windows that expose almost no UI Automation names fall back to OmniParser's YOLOv9 detector plus Windows OCR (optional).
+- A click is refused when another window covers the target point.
 
-Measured on Windows Calculator: a 6-click calculation in about 1.1 s end to end, one Jev call, about 110 ms per step after the first.
+Measured on Windows Calculator: `12 + 7` from exact names, including clearing a half-typed expression, in about
+1.0 s with no Jev call. `1 + 1` in about 0.85 s. The same sum in plain words ("clear", "1", "2", "add", "7",
+"equals sign") in about 1.6 s, one Jev call. Switching to Programmer mode the first time takes one Jev-chosen
+menu click (about 1.6 s); the learned route needs no Jev call (about 1.1 s).
+`1 + 1` with the animation cap is about 0.8 s. A Chrome address-bar URL is one step
+(`Ctrl+L`, then Enter waits for the new title in the same call): the Konrad Zuse article
+opened in about 1.1 s. The same article via Wikipedia's own search box — open the site,
+click Search, type the name — is one call at about 2.8 s.
 
 ## Tools
 
@@ -20,7 +30,7 @@ Measured on Windows Calculator: a 6-click calculation in about 1.1 s end to end,
 | `show_graph(app)` | Open the app's saved link tree as an HTML page (collapsible tree, filter box). `app` is a name like `olk` / `calculator` or part of a window title. |
 | `edit_graph(app, control, add=None, remove=None, delete=False)` | Correct the link tree: add or remove what clicking `control` reveals, or delete its routes. |
 | `explore(window, max_clicks=40)` | Grow the app graph by clicking each tab once (ribbon tabs, settings tabs). Never clicks buttons; skips names like Send, Delete, Close. |
-| `run_steps(window, steps)` | Run a whole plan in one call. Each step names a control (`"Seven"`, `"New mail"`, `"Density"`) or is `type "<text>" into <field>` (optionally `... and press enter`). A control that is not on screen but known to the graph is reached by walking the learned route first. Follows new windows the app opens. Stops at the first step that finds no control; clicks that changed nothing are flagged `screen_changed: false`. Returns per-step timings in ms, the route walked, and the final `screen_text`. |
+| `run_steps(window, steps)` | Run a whole plan in one call. Each step names a control (`"Seven"`, `"New mail"`, `"Density"`) or is `type "<text>" into <field>` (optionally `... and press enter`). Enter waits for the new page inside the call, so the steps after a navigation go in the same list. A control that is not on screen but known to the graph is reached by walking the learned route first. Follows new windows the app opens. Stops at the first step that finds no control; clicks that changed nothing are flagged `screen_changed: false`. Returns per-step timings in ms, the route walked, the final `screen_text`, and the buttons and fields now visible. |
 | `run_goal(window, goal, max_steps=12)` | Jev picks every step itself. When a field needs text it returns `needs_text`; answer with `provide_text`. Slower and weaker at ordered input such as numbers. |
 | `provide_text(text, press_enter=False)` | Continue a paused `run_goal`. |
 
@@ -32,8 +42,16 @@ Each app gets a JSON file in `WINDOWS_JEV_LIBRARY` (default `~/windows_jev_libra
   click in every run and from `explore`. A step whose control is not visible is reached through the shortest chain
   of these, e.g. `"Density"` in Outlook clicks `View` first.
 
-A step is grounded by exact name, then a graph route, and only then by Jev, so steps that use the control names
-from `describe` need no Jev call. A click counts as navigation only when at least 3 controls appear. `explore` clicks only tabs, because
+A step is grounded in this order:
+
+1. Exact name on screen (`"Plus"`, also `"the Plus button"`). No Jev call.
+2. Exact name the graph can reach: walk the route, then click.
+3. Jev, over the controls on screen plus the graph's controls on other screens. `"programmer mode"` can resolve
+   to `Programmer Calculator` behind `Open Navigation`, and the route is walked.
+4. Jev picks the tab or menu most likely to reveal the control, at most twice. Only navigation-like names are
+   offered (never Send, Delete, Close, data rows). What the click reveals is learned, so step 2 covers it next time.
+
+A click counts as navigation only when at least 3 controls appear. `explore` clicks only tabs, because
 clicking unknown buttons in apps like Outlook can send, delete or move data. Delete or edit the JSON to correct it.
 
 Every run writes screenshots, annotated candidates and a README with timings to `WINDOWS_JEV_LOGS`

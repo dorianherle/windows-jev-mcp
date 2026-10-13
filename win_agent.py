@@ -41,6 +41,9 @@ JEV_MODEL = "jev-1.13.0"
 # Upgrade path is a first Choice over screen regions, then a second over that region.
 MAX_CANDIDATES = 250
 DONE_THRESHOLD = 0.7
+# Every Jev choice includes "none". A real match scores ~0.9, a near name ("Clear" for
+# "Clear entry") ~0.5, and a control that is not on screen loses to "none" (~0.97).
+CONFIDENT = 0.4
 # A window with fewer named controls than this is treated as opaque to UI Automation.
 UIA_MIN_CONTROLS = 8
 user32 = ctypes.windll.user32
@@ -50,13 +53,36 @@ _log_pool = ThreadPoolExecutor(max_workers=1)
 # ---------------------------------------------------------------- windows
 
 
+def _cloaked(hwnd: int) -> bool:
+    """Hidden by the shell although 'visible': a suspended UWP app's CoreWindow, another desktop."""
+    value = wintypes.DWORD()
+    return not ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(value), 4) and bool(value.value)
+
+
+def app_windows(pid: int, skip: int = 0) -> list[int]:
+    """Visible top-level windows of this process, including untitled menus and popups."""
+    found = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    def callback(hwnd, _lparam):
+        if int(hwnd) != skip and user32.IsWindowVisible(hwnd) and not _cloaked(hwnd):
+            owner = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            if owner.value == pid:
+                found.append(int(hwnd))
+        return True
+
+    user32.EnumWindows(callback, 0)
+    return found[:8]
+
+
 def enum_windows() -> list[tuple[int, str]]:
     found = []
 
     @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
     def callback(hwnd, _lparam):
         length = user32.GetWindowTextLengthW(hwnd)
-        if user32.IsWindowVisible(hwnd) and length:
+        if user32.IsWindowVisible(hwnd) and length and not _cloaked(hwnd):
             buf = ctypes.create_unicode_buffer(length + 1)
             user32.GetWindowTextW(hwnd, buf, length + 1)
             found.append((int(hwnd), buf.value))
@@ -144,9 +170,20 @@ def type_text(text: str) -> None:
         time.sleep(0.005)
 
 
+def bring_onscreen(hwnd: int) -> None:
+    """Maximize a window whose center is off the desktop. A restored Chrome can open below the screen."""
+    left, top, right, bottom = window_rect(hwnd)
+    cx, cy = (left + right) // 2, (top + bottom) // 2
+    vx, vy = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)
+    vw, vh = user32.GetSystemMetrics(78), user32.GetSystemMetrics(79)
+    if vw > 0 and vh > 0 and not (vx <= cx < vx + vw and vy <= cy < vy + vh):
+        user32.ShowWindow(hwnd, 3)
+
+
 def focus(hwnd: int) -> None:
     # Sharing the foreground thread's input state lets SetForegroundWindow succeed
     # without a synthetic Alt tap, which would put the app into menu-shortcut mode.
+    bring_onscreen(hwnd)
     foreground = user32.GetForegroundWindow()
     if foreground == hwnd:
         return
@@ -160,39 +197,75 @@ def focus(hwnd: int) -> None:
     user32.AttachThreadInput(ours, theirs, False)
 
 
-def click(x: int, y: int) -> None:
+def owns_point(hwnd: int, pid: int, x: int, y: int) -> bool:
+    """The window under (x, y) is `hwnd` or belongs to its process (menus, popups)."""
+    under = user32.WindowFromPoint(wintypes.POINT(int(x), int(y)))
+    if not under:
+        return False
+    if user32.GetAncestor(under, 2) == hwnd:  # GA_ROOT
+        return True
+    owner = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(under, ctypes.byref(owner))
+    return owner.value == pid
+
+
+def tap(vk: int) -> None:
+    events = [_key(vk=vk), _key(vk=vk, flags=0x0002)]
+    user32.SendInput(len(events), (_INPUT * len(events))(*events), ctypes.sizeof(_INPUT))
+
+
+def hotkey(*vks: int) -> None:
+    events = [_key(vk=vk) for vk in vks] + [_key(vk=vk, flags=0x0002) for vk in reversed(vks)]
+    user32.SendInput(len(events), (_INPUT * len(events))(*events), ctypes.sizeof(_INPUT))
+
+
+def click(x: int, y: int, hwnd: int, pid: int) -> None:
+    """Click only if (x, y) is inside the target app; another window on top would get the click."""
+    if not owns_point(hwnd, pid, x, y):
+        focus(hwnd)
+        time.sleep(0.05)
+        if not owns_point(hwnd, pid, x, y):
+            raise RuntimeError(f"another window covers ({x}, {y}); click refused")
     user32.SetCursorPos(int(x), int(y))
     user32.mouse_event(0x0002, 0, 0, 0, 0)
     user32.mouse_event(0x0004, 0, 0, 0, 0)
+
+
+def _shrink(image: Image.Image) -> Image.Image:
+    return image.convert("L").reduce(2)
+
+
+def _differs(a: Image.Image, b: Image.Image) -> bool:
+    """True when any averaged pixel changed. Idle grabs of a static window differ by 0."""
+    # ponytail: Calculator's second "1" moves the expression by at most 4 gray levels, so a
+    # threshold of 8 waited out 600 ms and marked the button dead. A noisy display that
+    # flickers every frame never looks still and uses the whole timeout.
+    return ImageChops.difference(a, b).getbbox() is not None
 
 
 def settle(rect: tuple[int, int, int, int], before: Image.Image, timeout: float = 0.6) -> tuple[float, bool]:
     """Wait until the window changed and then stopped changing."""
     # ponytail: 600 ms with no pixel change counts as a dead click; an app that reacts
     # slower than that gets its control marked dead. Raise the timeout for such apps.
-    def small(image: Image.Image) -> Image.Image:
-        # A 4x4 box average is 4x cheaper than resize() and a 1 px caret still moves it by ~64.
-        return image.convert("L").reduce(4)
-
-    def differs(a: Image.Image, b: Image.Image) -> bool:
-        # Any pixel changing counts, so a single updated digit is seen.
-        return ImageChops.difference(a, b).point(lambda v: 255 if v > 24 else 0).getbbox() is not None
-
-    first = small(before)
+    first = _shrink(before)
     previous = first
     changed = False
     t0 = time.perf_counter()
     still_since = t0
     while time.perf_counter() - t0 < timeout:
         # No sleep: a desktop grab already waits for the next composed frame (~17 ms).
-        now = small(grab(rect))
+        now = _shrink(grab(rect))
         t = time.perf_counter()
-        changed = changed or differs(first, now)
-        if differs(previous, now):
+        changed = changed or _differs(first, now)
+        if _differs(previous, now):
             still_since = t
         previous = now
         # 40 ms spans more than two 60 Hz frames, so a running animation cannot look still.
         if changed and t - still_since >= 0.04:
+            break
+        # ponytail: a display that keeps animating (scientific calculator) never pauses 40 ms
+        # and used to burn the whole 600 ms. Once a change is seen, the click landed.
+        if changed and t - t0 >= 0.09:
             break
     return (time.perf_counter() - t0) * 1000, changed
 
@@ -220,89 +293,179 @@ _UIA_EDITABLE_TYPES = {50004, 50030, 50003}
 _uia = None
 
 
-def uia_candidates(hwnd: int, rect: tuple[int, int, int, int]) -> list[dict]:
-    """All named on-screen controls in one cross-process call (FindAllBuildCache)."""
-    global _uia
+def _pack(element, U, rect) -> dict | None:
+    """One cached element as a control dict, or None when it is not a clickable target."""
     import comtypes
 
-    if _uia is None:
-        import comtypes.client
-
-        comtypes.client.GetModule("UIAutomationCore.dll")
-        from comtypes.gen import UIAutomationClient as U
-
-        client = comtypes.CoCreateInstance(
-            U.CUIAutomation._reg_clsid_, interface=U.IUIAutomation, clsctx=comtypes.CLSCTX_INPROC_SERVER
-        )
-        request = client.CreateCacheRequest()
-        for prop in (
-            U.UIA_NamePropertyId,
-            U.UIA_ControlTypePropertyId,
-            U.UIA_BoundingRectanglePropertyId,
-            U.UIA_IsEnabledPropertyId,
-            U.UIA_IsOffscreenPropertyId,
-            U.UIA_ValueValuePropertyId,
-            U.UIA_ValueIsReadOnlyPropertyId,
-            U.UIA_IsValuePatternAvailablePropertyId,
-            U.UIA_IsTextPatternAvailablePropertyId,
-            U.UIA_IsKeyboardFocusablePropertyId,
-        ):
-            request.AddProperty(prop)
-        request.TreeScope = U.TreeScope_Element
-        request.AutomationElementMode = U.AutomationElementMode_None
-        # Filtering in the query halves the elements marshalled from busy web apps (Outlook).
-        condition = client.CreateAndConditionFromArray([
-            client.CreatePropertyCondition(U.UIA_IsControlElementPropertyId, True),
-            client.CreatePropertyCondition(U.UIA_IsOffscreenPropertyId, False),
-            client.CreatePropertyCondition(U.UIA_IsEnabledPropertyId, True),
-            client.CreateNotCondition(client.CreatePropertyCondition(U.UIA_NamePropertyId, "")),
-        ])
-        _uia = (U, client, request, condition)
-    U, client, request, condition = _uia
-    found = client.ElementFromHandle(hwnd).FindAllBuildCache(U.TreeScope_Descendants, condition, request)
     left, top, right, bottom = rect
     width, height = right - left, bottom - top
-    out = []
-    seen = set()
-    for index in range(found.Length):
-        element = found.GetElement(index)
-        try:
-            name = (element.CachedName or "").strip()[:60]
-            kind = element.CachedControlType
-            box = element.CachedBoundingRectangle
-            hidden = element.CachedIsOffscreen or not element.CachedIsEnabled
-            read_only = element.GetCachedPropertyValue(U.UIA_IsValuePatternAvailablePropertyId) is True and (
-                element.GetCachedPropertyValue(U.UIA_ValueIsReadOnlyPropertyId) is True
-            )
-            rich = element.GetCachedPropertyValue(U.UIA_IsTextPatternAvailablePropertyId) is True and (
-                element.GetCachedPropertyValue(U.UIA_IsKeyboardFocusablePropertyId) is True
-            )
-        except comtypes.COMError:  # UIA_E_ELEMENTNOTAVAILABLE: removed while the app redraws (WebView2)
-            continue
-        # A web page's document reports its URL as a read-only value; a contenteditable box
-        # (Outlook's To line) is a focusable Group with a TextPattern and no ValuePattern.
-        editable = not read_only and (kind in _UIA_EDITABLE_TYPES or (rich and kind != 50030))
-        if not name or hidden or (kind in _UIA_SKIP_TYPES and not editable):
-            continue
-        x1, y1 = max(0, box.left - left), max(0, box.top - top)
-        x2, y2 = min(width, box.right - left), min(height, box.bottom - top)
-        if x2 <= x1 or y2 <= y1 or (name, x1, y1) in seen:
-            continue
-        seen.add((name, x1, y1))
-        label = f"{name} ({_region((x1 + x2) / 2, (y1 + y2) / 2, width, height)})"
-        if editable:
-            try:
-                value = element.GetCachedPropertyValue(U.UIA_ValueValuePropertyId)
-            except comtypes.COMError:
-                value = None
-            label += f" [editable, contains '{value[:40]}']" if isinstance(value, str) and value else " [editable, empty]"
-        out.append(
-            {
-                "text": name, "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                "kind": "uia_text" if kind == 50020 else "uia", "ctype": kind, "editable": editable, "label": label,
-            }
+    try:
+        name = (element.CachedName or "").strip()[:60]
+        kind = element.CachedControlType
+        box = element.CachedBoundingRectangle
+        hidden = element.CachedIsOffscreen or not element.CachedIsEnabled
+        read_only = element.GetCachedPropertyValue(U.UIA_IsValuePatternAvailablePropertyId) is True and (
+            element.GetCachedPropertyValue(U.UIA_ValueIsReadOnlyPropertyId) is True
         )
+        rich = element.GetCachedPropertyValue(U.UIA_IsTextPatternAvailablePropertyId) is True and (
+            element.GetCachedPropertyValue(U.UIA_IsKeyboardFocusablePropertyId) is True
+        )
+    except comtypes.COMError:
+        return None
+    # A web page's document reports its URL as a read-only value; a contenteditable box
+    # (Outlook's To line) is a focusable Group with a TextPattern and no ValuePattern.
+    editable = not read_only and (kind in _UIA_EDITABLE_TYPES or (rich and kind != 50030))
+    if not name or hidden or (kind in _UIA_SKIP_TYPES and not editable):
+        return None
+    x1, y1 = max(0, box.left - left), max(0, box.top - top)
+    x2, y2 = min(width, box.right - left), min(height, box.bottom - top)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    label = f"{name} ({_region((x1 + x2) / 2, (y1 + y2) / 2, width, height)})"
+    if editable:
+        try:
+            value = element.GetCachedPropertyValue(U.UIA_ValueValuePropertyId)
+        except comtypes.COMError:
+            value = None
+        label += f" [editable, contains '{value[:40]}']" if isinstance(value, str) and value else " [editable, empty]"
+    return {
+        "text": name, "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+        "kind": "uia_text" if kind == 50020 else "uia", "ctype": kind, "editable": editable, "label": label,
+    }
+
+
+def _ensure_uia():
+    """UI Automation client, cache request, and the on-screen-named filter. Once per process."""
+    global _uia
+    if _uia is not None:
+        return _uia
+    import comtypes
+    import comtypes.client
+
+    comtypes.client.GetModule("UIAutomationCore.dll")
+    from comtypes.gen import UIAutomationClient as U
+
+    client = comtypes.CoCreateInstance(
+        U.CUIAutomation._reg_clsid_, interface=U.IUIAutomation, clsctx=comtypes.CLSCTX_INPROC_SERVER
+    )
+    request = client.CreateCacheRequest()
+    for prop in (
+        U.UIA_NamePropertyId,
+        U.UIA_ControlTypePropertyId,
+        U.UIA_BoundingRectanglePropertyId,
+        U.UIA_IsEnabledPropertyId,
+        U.UIA_IsOffscreenPropertyId,
+        U.UIA_ValueValuePropertyId,
+        U.UIA_ValueIsReadOnlyPropertyId,
+        U.UIA_IsValuePatternAvailablePropertyId,
+        U.UIA_IsTextPatternAvailablePropertyId,
+        U.UIA_IsKeyboardFocusablePropertyId,
+    ):
+        request.AddProperty(prop)
+    request.TreeScope = U.TreeScope_Element
+    request.AutomationElementMode = U.AutomationElementMode_None
+    # Filtering in the query halves the elements marshalled from busy web apps (Outlook).
+    condition = client.CreateAndConditionFromArray([
+        client.CreatePropertyCondition(U.UIA_IsControlElementPropertyId, True),
+        client.CreatePropertyCondition(U.UIA_IsOffscreenPropertyId, False),
+        client.CreatePropertyCondition(U.UIA_IsEnabledPropertyId, True),
+        client.CreateNotCondition(client.CreatePropertyCondition(U.UIA_NamePropertyId, "")),
+    ])
+    _uia = (U, client, request, condition)
+    return _uia
+
+
+def uia_candidates(hwnd: int, rect: tuple[int, int, int, int]) -> list[dict]:
+    """All named on-screen controls in one cross-process call (FindAllBuildCache)."""
+    U, client, request, condition = _ensure_uia()
+    found = client.ElementFromHandle(hwnd).FindAllBuildCache(U.TreeScope_Descendants, condition, request)
+    out, seen = [], set()
+    for index in range(found.Length):
+        item = _pack(found.GetElement(index), U, rect)
+        if item is None or (item["text"], item["x1"], item["y1"]) in seen:
+            continue
+        seen.add((item["text"], item["x1"], item["y1"]))
+        out.append(item)
     return out
+
+
+def _scroll_into_view(element, U) -> None:
+    try:
+        pattern = element.GetCurrentPattern(U.UIA_ScrollItemPatternId)
+        if pattern:
+            pattern.QueryInterface(U.IUIAutomationScrollItemPattern).ScrollIntoView()
+    except Exception:
+        return
+
+
+def _inside(element, U, rect, cached: bool) -> dict | None:
+    """Exact-name control whose box meets this window. Text and custom rows count; offscreen ones do not."""
+    import comtypes
+
+    left, top, right, bottom = rect
+    width, height = right - left, bottom - top
+    try:
+        if cached:
+            name = (element.CachedName or "").strip()[:60]
+            hidden = element.CachedIsOffscreen or not element.CachedIsEnabled
+            box = element.CachedBoundingRectangle
+            kind = element.CachedControlType
+        else:
+            name = (element.CurrentName or "").strip()[:60]
+            hidden = element.CurrentIsOffscreen or not element.CurrentIsEnabled
+            box = element.CurrentBoundingRectangle
+            kind = element.CurrentControlType
+    except (comtypes.COMError, AttributeError):
+        return None
+    if not name or hidden or width <= 0 or height <= 0:
+        return None
+    if box.right <= left or box.left >= right or box.bottom <= top or box.top >= bottom:
+        return None
+    x1, y1 = max(0, box.left - left), max(0, box.top - top)
+    x2, y2 = min(width, box.right - left), min(height, box.bottom - top)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    label = f"{name} ({_region((x1 + x2) / 2, (y1 + y2) / 2, width, height)})"
+    return {
+        "text": name, "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+        "kind": "uia", "ctype": kind, "editable": False, "label": label,
+    }
+
+
+def _named_click(element, U, rect) -> dict | None:
+    """Scroll an offscreen exact-name row into this window, then keep it only if it landed inside."""
+    try:
+        if element.CurrentIsOffscreen:
+            _scroll_into_view(element, U)
+    except Exception:
+        return None
+    return _inside(element, U, rect, cached=False)
+
+
+def uia_find(hwnd: int, rect: tuple[int, int, int, int], name: str) -> dict | None:
+    """First on-screen control with this exact name. A hit near the top does not walk the rest of the page.
+
+    Menu text and custom rows count. An offscreen copy of the same name is not clicked: the last
+    run hit '+ add step' at y=1427, off the desktop, and the click was refused.
+    """
+    if not name:
+        return None
+    U, client, request, _condition = _ensure_uia()
+    root = client.ElementFromHandle(hwnd)
+    condition = client.CreatePropertyCondition(U.UIA_NamePropertyId, name)
+    element = root.FindFirstBuildCache(U.TreeScope_Descendants, condition, request)
+    if not element:
+        return None
+    item = _pack(element, U, rect)
+    if item is not None and item["kind"] != "uia_text":
+        return item
+    found = root.FindAllBuildCache(U.TreeScope_Descendants, condition, request)
+    for index in range(found.Length):
+        item = _inside(found.GetElement(index), U, rect, cached=True)
+        if item is not None:
+            return item
+    live = root.FindFirst(U.TreeScope_Descendants, condition)
+    return _named_click(live, U, rect) if live else None
 
 
 def set_value(x: int, y: int, text: str) -> bool:
@@ -447,14 +610,20 @@ def screen_text(candidates: list[dict]) -> list[str]:
 _jev: http.client.HTTPSConnection | None = None
 
 
+def _dotenv(path: Path, name: str = "TYPESAFE_API_KEY") -> str:
+    """Value of name in a .env file. Last match wins; '' if the file or name is absent."""
+    if not path.is_file():
+        return ""
+    found = ""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        key, _, value = line.partition("=")
+        if key.strip() == name:
+            found = value.strip().strip("\"'")
+    return found
+
+
 def api_key() -> str:
-    key = os.environ.get("TYPESAFE_API_KEY", "").strip()
-    env_file = Path(__file__).with_name(".env")  # gitignored
-    if not key and env_file.exists():
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            name, _, value = line.partition("=")
-            if name.strip() == "TYPESAFE_API_KEY":
-                key = value.strip().strip("\"'")
+    key = os.environ.get("TYPESAFE_API_KEY", "").strip() or _dotenv(Path(__file__).with_name(".env"))
     if not key:
         import winreg
 
@@ -497,13 +666,46 @@ def parse_step(step: str) -> tuple[str, str | None, bool]:
     return re.sub(r"^click\s+", "", step.strip(), flags=re.I), None, False
 
 
+def _choices(questions: dict, goal: str, history: list[str] | None, screen: list[str]) -> tuple[dict, float]:
+    """Ask choice questions with a 'none' option; question key -> confidently chosen option id."""
+    for question in questions.values():
+        question["criteria"]["none"] = "None of these controls"
+    body = json.dumps(
+        {
+            "model": JEV_MODEL,
+            "state": {"goal": goal, "previous_actions": history or [], "screen_text": screen},
+            "questions": questions,
+        }
+    )
+    answer, elapsed = _post(body)
+    chosen = {
+        key: str(value.get("choice")) for key, value in answer["answers"].items()
+        if value.get("choice") != "none" and value.get("confidence", 0) >= CONFIDENT
+    }
+    return chosen, elapsed
+
+
 def ask_targets(
-    items: list[tuple[int, str, str]], offered: list[dict], screen: list[str]
-) -> tuple[dict[int, dict], float]:
-    """Ground (index, target, action) items in one request; Jev answers each independently."""
+    items: list[tuple[int, str, str]],
+    offered: list[dict],
+    screen: list[str],
+    goal: str = "",
+    history: list[str] | None = None,
+    elsewhere: list[str] = (),
+) -> tuple[dict[int, dict], str | None, float]:
+    """Ground (index, target, action) items in one request. A step Jev answers with 'none' or low
+    confidence gets no pick: its control is not on this screen.
+
+    `elsewhere` are controls the app graph can reach from here. They are offered for the first
+    item too; picking one returns its name, to be reached by walking the graph.
+    """
     questions = {}
+    far: dict[str, str] = {}
     for index, target, action in items:
         criteria = {c["id"]: c["label"] for c in offered if c["action"] == action}
+        if index == items[0][0]:
+            far = {f"g{j}": name for j, name in enumerate(elsewhere[: max(0, 254 - len(criteria))])}
+            criteria.update({key: f"{name} (on another screen)" for key, name in far.items()})
         if criteria:
             questions[f"s{index}"] = {
                 "type": "choice",
@@ -511,16 +713,34 @@ def ask_targets(
                 "criteria": criteria,
             }
     if not questions:
-        return {}, 0.0
-    body = json.dumps({"model": JEV_MODEL, "state": {"screen_text": screen}, "questions": questions})
-    answer, elapsed = _post(body)
+        return {}, None, 0.0
+    chosen, elapsed = _choices(questions, goal, history, screen)
     by_id = {c["id"]: c for c in offered}
-    picks = {}
-    for key, value in answer["answers"].items():
-        chosen = by_id.get(str(value.get("choice")))
-        if chosen is not None:
-            picks[int(key[1:])] = chosen
-    return picks, elapsed
+    picks = {int(key[1:]): by_id[cid] for key, cid in chosen.items() if cid in by_id}
+    return picks, far.get(chosen.get(f"s{items[0][0]}", "")), elapsed
+
+
+def ask_opener(
+    target: str, offered: list[dict], screen: list[str], goal: str, history: list[str], skip: set[str]
+) -> tuple[dict | None, float]:
+    """The control most likely to reveal `target` (a tab, menu, 'More', navigation), or None.
+
+    Only navigation-like names are offered: never Send/Delete-style controls or data rows.
+    """
+    safe = [
+        c for c in offered
+        if c["action"] == "click" and not c.get("editable") and c["text"] not in skip
+        and _navlike(c["text"]) and not _RISKY.search(c["text"])
+    ]
+    if not safe:
+        return None, 0.0
+    question = {
+        "type": "choice",
+        "instructions": f"'{target}' is not on screen. Which control opens the menu, tab or page that shows it?",
+        "criteria": {c["id"]: c["label"] for c in safe},
+    }
+    chosen, elapsed = _choices({"open": question}, goal, history, screen)
+    return next((c for c in safe if c["id"] == chosen.get("open")), None), elapsed
 
 
 def _post(body: str) -> tuple[dict, float]:
@@ -578,11 +798,44 @@ def _norm(text: str) -> str:
     return " ".join(text.lower().split())
 
 
+def _navlike(name: str) -> bool:
+    # ponytail: names with a digit or over 40 chars are data (dates, times, counts, mail rows),
+    # not controls. Ceiling: real controls like "Heading 1" are never learned or used as openers.
+    return bool(name) and len(name) <= 40 and not re.search(r"\d", name)
+
+
+_FILLER = re.compile(
+    r"^(?:(?:click|press|tap|select|choose|hit|push)\s+)?(?:on\s+)?(?:the\s+)?|\s+(?:button|tab|menu|item|link|key)$", re.I
+)
+
+
 def lookup(target: str, action: str, offered: list[dict]) -> dict | None:
-    """The one visible control named exactly like the step, if there is exactly one."""
-    wanted = _norm(target)
-    exact = [c for c in offered if c["action"] == action and _norm(c["text"]) == wanted]
-    return exact[0] if len(exact) == 1 else None
+    """The one visible control named like the step ("Plus", "the Plus button", "Clear" for "Clear entry")."""
+    for wanted in dict.fromkeys((_norm(target), _norm(_FILLER.sub("", target)))):
+        if not wanted:
+            continue
+        exact = [c for c in offered if c["action"] == action and _norm(c["text"]) == wanted]
+        if len(exact) == 1:
+            return exact[0]
+        # "Clear" is the visible "Clear entry": the extra word is a qualifier, not a different command.
+        if len(wanted) >= 3:
+            prefixed = [
+                c for c in offered
+                if c["action"] == action and _norm(c["text"]).startswith(wanted)
+                and _norm(c["text"])[len(wanted):] in (" entry", " button", " tab", " menu", " item", " key")
+            ]
+            if len(prefixed) == 1:
+                return prefixed[0]
+        # "Evaporation" is the one button "Evaporation near-normal line-of-sight PVD".
+        # Risky words stay exact: "Delete" must not hit "Delete all".
+        if len(wanted) >= 4 and not _RISKY.search(wanted):
+            described = [
+                c for c in offered
+                if c["action"] == action and _norm(c["text"]).startswith(wanted + " ")
+            ]
+            if len(described) == 1:
+                return described[0]
+    return None
 
 
 class Library:
@@ -601,9 +854,7 @@ class Library:
     def record(self, control: str, before: set[str], after: set[str]) -> None:
         if _RISKY.search(control):  # Send, Delete...: what follows is a new state, not a menu
             return
-        # ponytail: names with a digit or over 40 chars are data (dates, times, counts, mail rows),
-        # not controls. Ceiling: real controls like "Heading 1" are never learned as revealed.
-        appeared = sorted(n for n in after - before if len(n) <= 40 and not re.search(r"\d", n))
+        appeared = sorted(n for n in after - before if _navlike(n))
         # ponytail: a click counts as navigation only when >= 3 controls appear, so a click that
         # just renames one control (Calculator "Clear" -> "Clear entry") never becomes a route.
         # Ceiling: menus with only one or two entries are not learned.
@@ -730,6 +981,8 @@ def library_for(name: str) -> Library:
 
 # ---------------------------------------------------------------- session
 
+_vision: tuple | None = None  # (YOLOv9 detector, OCR language) once a window needed vision
+
 
 class Session:
     """One goal on one window. advance() runs until done, out of steps, or text is needed."""
@@ -740,9 +993,14 @@ class Session:
             raise ValueError(f"no visible window title contains {window!r}")
         self.hwnd, self.title = match[0]
         self.pid, self.app = app_of(self.hwnd, self.title)
+        # Windows of this process (menus, dialogs) belong to the app. ApplicationFrameHost hosts
+        # every UWP app, so for those only the frame itself counts.
+        self.own_pid = 0 if process_of(self.hwnd)[1] == "applicationframehost" else self.pid
         self.lib = Library(self.app)
         self.names: set[str] = set()  # control names visible at the last read
         self._clicked: tuple[str, set[str]] | None = None  # (control, names before) of the last click
+        self._norecord = False  # a name-only find has no "before" set, so it must not grow the graph
+        self._just_clicked = False
         self.goal = goal
         self.max_steps = max_steps
         self.history: list[str] = []
@@ -754,11 +1012,10 @@ class Session:
         self.pending: tuple | None = None
         self.started = time.perf_counter()
         self.out = RUNS / datetime.now().strftime("%Y%m%d_%H%M%S") if log else None
-        self._detector = None
-        self._lang = None
         self._pool = ThreadPoolExecutor(max_workers=1)
 
     def _read(self, rect, shot_future) -> tuple[list[dict], Image.Image, dict]:
+        global _vision
         t0 = time.perf_counter()
         candidates = uia_candidates(self.hwnd, rect)
         timing = {"uia_ms": round((time.perf_counter() - t0) * 1000, 1)}
@@ -766,15 +1023,13 @@ class Session:
         source = "uia"
         if len(candidates) < UIA_MIN_CONTROLS:
             source = "vision"
-            if self._detector is None:
-                from fast_detect import load_detector
+            from fast_detect import load_detector, predict
 
-                self._detector = load_detector()
-                self._lang = pick_lang()
-            from fast_detect import predict
-
-            lines_future = self._pool.submit(ocr_lines, shot, self._lang)
-            boxes, _scores, _infer = predict(self._detector, shot, 640)
+            if _vision is None:  # seconds to load; kept for the life of the process
+                _vision = (load_detector(), pick_lang())
+            detector, lang = _vision
+            lines_future = self._pool.submit(ocr_lines, shot, lang)
+            boxes, _scores, _infer = predict(detector, shot, 640)
             candidates = build_candidates(lines_future.result(), boxes.tolist(), shot.size)
         timing["source"] = source
         timing["read_ms"] = round((time.perf_counter() - t0) * 1000, 1)
@@ -830,18 +1085,70 @@ class Session:
         self._act(chosen, rect, shot, offered, record, t_step, text, press_enter)
         return self.advance()
 
+    def _title(self) -> str:
+        length = user32.GetWindowTextLengthW(self.hwnd)
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(self.hwnd, buffer, length + 1)
+        return buffer.value
+
+    def _wait_navigation(self, title: str) -> None:
+        """After Enter, block until the window title changes. No control-tree reads.
+
+        A loading page's tree never sits still, and walking it (Wikipedia, a full inbox) costs
+        more than the navigation. The next step reads the tree once the title has committed.
+        2.5 s if the title never moves. Clicks do not call this.
+        """
+        deadline = time.perf_counter() + 2.5
+        while time.perf_counter() < deadline:
+            if self._title() != title:
+                return
+            time.sleep(0.02)
+
     def _follow(self) -> None:
         """Switch to a new window of the same app (compose window, dialog) once it is in front."""
         front = user32.GetForegroundWindow()
-        if front and front != self.hwnd and process_of(front)[0] == self.pid:
+        if front and front != self.hwnd and process_of(front)[0] == self.own_pid:
             length = user32.GetWindowTextLengthW(front)
             buffer = ctypes.create_unicode_buffer(length + 1)
             user32.GetWindowTextW(front, buffer, length + 1)
             self.hwnd, self.title = front, buffer.value
 
+    def _spot(self, name: str, action: str):
+        """The control with this exact name, without listing the rest of the page.
+
+        Menus and dropdowns are often a second window of the same process, sometimes untitled.
+        """
+        self._follow()
+        bring_onscreen(self.hwnd)
+        if user32.IsIconic(self.hwnd):
+            focus(self.hwnd)
+            time.sleep(0.3)
+        hwnds = [self.hwnd]
+        if self.own_pid:
+            hwnds.extend(app_windows(self.own_pid, self.hwnd))
+        t0 = time.perf_counter()
+        for hwnd in hwnds:
+            rect = window_rect(hwnd)
+            if rect[2] <= rect[0] or rect[3] <= rect[1]:
+                continue
+            item = uia_find(hwnd, rect, name)
+            if item is None:
+                continue
+            offered = offer([item], set(), set())
+            chosen = next((c for c in offered if c["action"] == action), None)
+            if chosen is None:
+                continue
+            elapsed = round((time.perf_counter() - t0) * 1000, 1)
+            return rect, [item], grab(rect), {"source": "name", "uia_ms": elapsed, "read_ms": elapsed}, offered, chosen
+        return None
+
     def _look(self):
         """Read the front window of the app and record what the last click revealed."""
         self._follow()
+        bring_onscreen(self.hwnd)
+        if user32.IsIconic(self.hwnd):  # a minimized window has no layout to read
+            focus(self.hwnd)
+            time.sleep(0.3)
         rect = window_rect(self.hwnd)
         candidates, shot, timing = self._read(rect, self._pool.submit(grab, rect))
         offered = offer(candidates, set(), set())
@@ -852,7 +1159,8 @@ class Session:
 
     def _hop(self, control: dict, rect, shot) -> bool:
         self._clicked = (control["text"], self.names)
-        click(rect[0] + (control["x1"] + control["x2"]) // 2, rect[1] + (control["y1"] + control["y2"]) // 2)
+        x, y = rect[0] + (control["x1"] + control["x2"]) // 2, rect[1] + (control["y1"] + control["y2"]) // 2
+        click(x, y, self.hwnd, self.own_pid)
         return settle(rect, shot)[1]
 
     def describe(self) -> dict:
@@ -905,52 +1213,134 @@ class Session:
         shows the control, then Jev. Jev grounds all remaining unknown steps in one request and
         its answers are reused while the set of clickable controls stays the same. A control the
         graph has seen but cannot reach from here (a window still opening) is waited for up to 3 s.
+        A control nobody has seen yet is searched for: Jev picks the tab or menu that should
+        reveal it (at most 2 clicks), and the graph learns that route for next time. Enter waits
+        for the new page inside this call, so the steps after a navigation belong in the same plan.
         """
         plan = [parse_step(step) for step in steps]
         focus(self.hwnd)
         picks: dict[int, dict] = {}
+        asked: set[int] = set()
         layout = None
         for index, (target, text, press_enter) in enumerate(plan):
             self.step = index + 1
             t_step = time.perf_counter()
             action = "click" if text is None else "type"
-            rect, candidates, shot, timing, offered = self._look()
-            chosen = lookup(target, action, offered)
-            path = self.lib.path_to(self.names, target) if chosen is None else None
-            # A window still opening keeps gaining controls (Outlook's compose pane): read again
-            # until the name shows up or the controls stop changing; a known control gets 3 s.
-            while chosen is None and not path and time.perf_counter() - t_step < 3.0:
-                seen = self.names
-                time.sleep(0.05)
+            jev_ms, route, opened = 0.0, [], set()
+            wanted, alias, by_jev = target, None, False
+            # Browser omnibox: Ctrl+L, type, Delete. SetValue + Enter commits the inline
+            # completion ("google.com" opened Maps). Finding the bar would read the whole page.
+            if (
+                self.app in {"chrome", "msedge", "firefox"}
+                and text
+                and press_enter
+                and "://" in text
+                and "address" in _norm(target)
+            ):
+                focus(self.hwnd)
+                title = self._title()
+                tap(0x1B)  # a page search box, if open, would eat the URL
+                hotkey(0x11, 0x4C)  # Ctrl+L
+                time.sleep(0.12)  # the bar drops keys typed while it is still opening
+                type_text(text)
+                tap(0x2E)  # Delete: drops the selected inline completion (google.com -> Maps)
+                type_text("\n")
+                self.history.append(f"type {text!r} into {target}")
+                self._wait_navigation(title)
+                self.records.append({
+                    "step": self.step,
+                    "source": "keys",
+                    "grounded_by": "address bar",
+                    "route": [],
+                    "read_ms": 0.0,
+                    "jev_ms": 0.0,
+                    "think_ms": round((time.perf_counter() - t_step) * 1000, 1),
+                    "settle_ms": 0.0,
+                    "screen_changed": True,
+                    "action": f"type {text!r} into {target}",
+                })
+                continue
+            spotted = self._spot(wanted, action)
+            # A click just opened this control (Search -> the search box, Au -> the Al row).
+            # Poll the exact name; a described button ("Evaporation near-normal...") will not
+            # appear under the short name, so lookup's unique prefix takes it without the wait.
+            token = _norm(wanted)
+            if spotted is None and self._just_clicked and not (len(token) >= 4 and " " not in token and not _RISKY.search(token)):
+                until = time.perf_counter() + 0.8
+                while spotted is None and time.perf_counter() < until:
+                    time.sleep(0.04)
+                    spotted = self._spot(wanted, action)
+            if spotted is not None:
+                rect, candidates, shot, timing, offered, chosen = spotted
+                self._norecord = True
+            while spotted is None:
                 rect, candidates, shot, timing, offered = self._look()
-                chosen = lookup(target, action, offered)
-                path = self.lib.path_to(self.names, target) if chosen is None else None
-                if self.names == seen and not self.lib.knows(target):
-                    break
-            grounded_by, jev_ms, route = "name", 0.0, []
-            if chosen is None:
-                for name in path or []:
-                    hop = next((c for c in offered if c["action"] == "click" and c["text"] == name), None)
-                    if hop is None:
-                        break
-                    self._hop(hop, rect, shot)
-                    route.append(name)
+                chosen = lookup(wanted, action, offered)
+                path = self.lib.path_to(self.names, wanted) if chosen is None else None
+                answered = index in picks and frozenset(_box_key(c) for c in offered) == layout
+                # A window still opening keeps gaining controls (Outlook's compose pane): read again
+                # until the name shows up or the controls stop changing; a known control gets 3 s.
+                # Only a click from this run can still be loading. A name shown twice is already
+                # here, and a step Jev answered on this same layout needs no wait either.
+                while (
+                    chosen is None and not path and not answered and (self.history or route)
+                    and time.perf_counter() - t_step < 3.0 and _norm(wanted) not in {_norm(n) for n in self.names}
+                ):
+                    seen = self.names
+                    time.sleep(0.05)
                     rect, candidates, shot, timing, offered = self._look()
-                chosen = lookup(target, action, offered) if route else None
-                grounded_by = "graph"
-            if chosen is None:
-                grounded_by = "jev"
-                by_box = {_box_key(c): c for c in offered}
-                chosen = picks.get(index)
-                current = by_box.get(_box_key(chosen)) if chosen is not None else None
-                # Renamed-in-place controls ("Clear" -> "Clear entry") keep the layout; a new or
-                # moved control (menu opened) or a renamed pick means the answers are stale.
-                if frozenset(by_box) != layout or current is None or current["label"] != chosen["label"]:
-                    items = [(i, t, "click" if x is None else "type") for i, (t, x, _) in enumerate(plan) if i >= index]
-                    picks, jev_ms = ask_targets(items, offered, screen_text(candidates))
-                    layout = frozenset(by_box)
-                    current = picks.get(index)
-                chosen = current
+                    chosen = lookup(wanted, action, offered)
+                    path = self.lib.path_to(self.names, wanted) if chosen is None else None
+                    if self.names == seen and not self.lib.knows(wanted) and time.perf_counter() - t_step > 0.7:
+                        break
+                if chosen is None and path:
+                    for name in path:
+                        hop = next((c for c in offered if c["action"] == "click" and c["text"] == name), None)
+                        if hop is None:
+                            break
+                        self._hop(hop, rect, shot)
+                        route.append(name)
+                        rect, candidates, shot, timing, offered = self._look()
+                    chosen = lookup(wanted, action, offered)
+                if chosen is None:
+                    by_box = {_box_key(c): c for c in offered}
+                    chosen = picks.get(index)
+                    current = by_box.get(_box_key(chosen)) if chosen is not None else None
+                    # Renamed-in-place controls ("Clear" -> "Clear entry") keep the layout; a new or
+                    # moved control (menu opened) or a renamed pick means the answers are stale.
+                    renamed = chosen is not None and (current is None or current["label"] != chosen["label"])
+                    if frozenset(by_box) != layout or index not in asked or renamed:
+                        # Steps whose name is on screen ground by name; Jev only gets the rest.
+                        items = [
+                            (i, t, "click" if x is None else "type") for i, (t, x, _) in enumerate(plan)
+                            if i == index or (i > index and lookup(t, "click" if x is None else "type", offered) is None)
+                        ]
+                        elsewhere = list(self.lib.reachable(self.names)) if alias is None else []
+                        picks, far, ms = ask_targets(
+                            items, offered, screen_text(candidates), self.goal, self.history, elsewhere
+                        )
+                        jev_ms += ms
+                        layout, asked = frozenset(by_box), {i for i, _t, _a in items}
+                        current = picks.get(index)
+                        if current is None and far is not None:
+                            wanted = alias = far  # on another screen: walk the graph to it
+                            continue
+                    chosen = current
+                    by_jev = chosen is not None
+                if chosen is not None or len(opened) >= 2 or len(_norm(target)) <= 3:
+                    # A short label ("Al") is a row in the menu just opened. Guessing a
+                    # navigation control ("Materials") leaves the page.
+                    break
+                opener, ms = ask_opener(target, offered, screen_text(candidates), self.goal, self.history, opened)
+                jev_ms += ms
+                if opener is None:
+                    break
+                opened.add(opener["text"])
+                route.append(opener["text"])
+                self._hop(opener, rect, shot)
+            grounded_by = None if chosen is None else (
+                "jev route" if opened else "jev graph" if alias else "jev" if by_jev else "graph" if route else "name"
+            )
             record = {
                 "step": self.step,
                 **timing,
@@ -963,9 +1353,29 @@ class Session:
                 "target": chosen["label"] if chosen else None,
             }
             if chosen is None:
+                for _ in opened:  # the search opened a menu; put it back
+                    tap(0x1B)
                 summary = self._finish(f"stopped: no control found for step {self.step} {steps[index]!r}", record, shot, offered, None)
                 return self._with_screen(summary)
+            before_title = self._title() if press_enter else ""
             self._act(chosen, rect, shot, offered, record, t_step, text, press_enter)
+            # "Clear entry" renames itself to "Clear" and a second click drops the whole expression.
+            wanted_name = _norm(_FILLER.sub("", target)) or _norm(target)
+            if text is None and _norm(chosen["text"]) != wanted_name:
+                rect, _candidates, shot, _timing, offered = self._look()
+                exact = next((c for c in offered if c["action"] == "click" and _norm(c["text"]) == wanted_name), None)
+                if exact is not None:
+                    x = rect[0] + (exact["x1"] + exact["x2"]) // 2
+                    y = rect[1] + (exact["y1"] + exact["y2"]) // 2
+                    self._clicked = (exact["text"], self.names)
+                    click(x, y, self.hwnd, self.own_pid)
+                    extra, changed = settle(rect, shot)
+                    record["settle_ms"] = round((record.get("settle_ms") or 0) + extra, 1)
+                    record["screen_changed"] = bool(record.get("screen_changed") or changed)
+                    record["action"] += f", then {exact['text']}"
+            # Enter loads another page. Wait here, so the next step of this same call sees it.
+            if press_enter:
+                self._wait_navigation(before_title)
         return self._with_screen(self._finish("done", None, None, None, None))
 
     def _with_screen(self, summary: dict) -> dict:
@@ -973,16 +1383,32 @@ class Session:
         summary["app"] = self.app
         self._follow()
         if user32.IsWindow(self.hwnd):
-            _rect, candidates, _shot, _timing, _offered = self._look()
+            length = user32.GetWindowTextLengthW(self.hwnd)
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(self.hwnd, buffer, length + 1)
+            if buffer.value:
+                self.title = buffer.value
+            summary["window"] = self.title
+            # Enter already waited for the new page inside the plan. One read is the screen
+            # the caller plans from; a click does not pay a second poll.
+            _rect, candidates, _shot, _timing, offered = self._look()
             summary["screen_text"] = screen_text(candidates)
+            # The calling agent plans the next step from this result, so it needs the new
+            # control names. Otherwise it has to call describe before it can continue.
+            summary["buttons"] = list(dict.fromkeys(
+                c["text"] for c in offered if c["action"] == "click" and not c.get("editable")
+            ))
+            summary["fields"] = list(dict.fromkeys(c["text"] for c in offered if c["action"] == "type"))
         self.lib.save()
         return summary
 
     def _act(self, chosen, rect, shot, offered, record, t_step, text, press_enter) -> None:
         cx = rect[0] + (chosen["x1"] + chosen["x2"]) // 2
         cy = rect[1] + (chosen["y1"] + chosen["y2"]) // 2
-        self._clicked = (chosen["text"], self.names) if text is None else None
-        click(cx, cy)
+        self._clicked = None if text is not None or self._norecord else (chosen["text"], self.names)
+        self._just_clicked = text is None
+        self._norecord = False
+        click(cx, cy, self.hwnd, self.own_pid)
         if text is not None:
             if set_value(cx, cy, text):
                 type_text("\n" if press_enter else "")
@@ -1000,9 +1426,14 @@ class Session:
             self.typed.add(chosen["text"])
         else:
             action = f"click {chosen['label']}"
-        settle_ms, changed = settle(rect, shot)
-        if text is None and not changed:
-            self.dead.add(chosen["label"])
+        # A page load keeps pixels moving for the whole 600 ms and the navigation wait reads
+        # the new controls itself, so the pixel wait would only delay the next step.
+        if press_enter:
+            settle_ms, changed = 0.0, True
+        else:
+            settle_ms, changed = settle(rect, shot)
+            if text is None and not changed:
+                self.dead.add(chosen["label"])
         self.history.append(action)
         record.update(action=action, settle_ms=round(settle_ms, 1), screen_changed=changed)
         if text is None:
@@ -1179,7 +1610,60 @@ def _self_check() -> None:
         again.edit("Table", remove=["Rows", "Columns", "OK"])
         again.edit("Rows", delete=True)
         assert "Table" not in again.reveals and "Rows" not in again.reveals
+        env = Path(root) / ".env"
+        env.write_text("# skip\nOTHER=no\nTYPESAFE_API_KEY=\"from-file\"\n", encoding="utf-8")
+        assert _dotenv(env) == "from-file" and _dotenv(Path(root) / "missing") == ""
     assert _RISKY.search("Send") and _RISKY.search("Delete all") and not _RISKY.search("Insert")
+    assert lookup("press the Go button", "click", offered)["text"] == "Go"
+    entry = {**button, "action": "click", "text": "Clear entry", "label": "Clear entry (middle-right)"}
+    close = {**button, "action": "click", "text": "Close Calculator", "label": "Close Calculator (top-right)"}
+    assert lookup("Clear", "click", [entry, close])["text"] == "Clear entry"
+    assert lookup("Clear", "click", [entry, {**entry, "text": "Clear history"}])["text"] == "Clear entry"
+    assert lookup("Clear", "click", [entry, {**entry, "text": "Clear button"}]) is None
+    assert lookup("Delete", "click", [{**entry, "text": "Delete all"}]) is None
+    evap = {**entry, "text": "Evaporation near-normal line-of-sight PVD"}
+    assert lookup("Evaporation", "click", [evap, {**entry, "text": "Spin coat resist coating"}])["text"] == evap["text"]
+    assert lookup("Al", "click", [{**entry, "text": "AlGaAs"}, {**entry, "text": "AlN"}]) is None
+    assert lookup("Evaporation", "click", [evap, {**evap, "text": "Evaporation of gold"}]) is None
+    blank = Image.new("L", (4, 4), 0)
+    flick = blank.copy()
+    flick.putpixel((0, 0), 1)
+    assert _differs(blank, flick) and not _differs(blank, blank)
+    assert lookup("Search", "type", offered)["text"] == "Search" and lookup("Go", "type", offered) is None
+    assert lookup("Go", "click", offered + [dict(offered[2], id="c9")]) is None  # two "Go": Jev decides
+
+    global _post
+    real_post, sent = _post, []
+
+    def fake_post(body):
+        sent.append(json.loads(body))
+        answers = {
+            "s0": {"choice": "c2", "confidence": 0.98},     # clear match
+            "s1": {"choice": "c0", "confidence": 0.3},      # a guess: dropped
+            "s2": {"choice": "none", "confidence": 0.9},    # Jev says it is not here
+            "s5": {"choice": "g1", "confidence": 0.9},      # a control on another screen
+            "open": {"choice": "c2", "confidence": 0.8},
+        }
+        return {"answers": {k: v for k, v in answers.items() if k in sent[-1]["questions"]}}, 1.0
+
+    _post = fake_post
+    try:
+        picks, far, _ms = ask_targets([(0, "go", "click"), (1, "x", "click"), (2, "y", "click")], offered, [])
+        assert picks == {0: offered[2]} and far is None, picks
+        assert sent[0]["questions"]["s0"]["criteria"]["none"]
+        picks, far, _ms = ask_targets([(5, "compact view", "click")], offered, [], elsewhere=["Cozy", "Compact"])
+        assert picks == {} and far == "Compact"
+        assert sent[1]["questions"]["s5"]["criteria"]["g1"] == "Compact (on another screen)"
+        sent.clear()
+        menu = [dict(button, id="c2", text="View", label="View (top-left)", action="click"),
+                dict(button, id="c3", text="Delete", label="Delete (top-left)", action="click"),
+                dict(button, id="c4", text="Mon 12 Oct, 3 unread", label="Mon 12 Oct (top-left)", action="click")]
+        opener, _ms = ask_opener("Density", menu, [], "", [], set())
+        assert opener["text"] == "View"
+        assert set(sent[0]["questions"]["open"]["criteria"]) == {"c2", "none"}  # no Delete, no data row
+        assert ask_opener("Density", menu, [], "", [], {"View"}) == (None, 0.0)
+    finally:
+        _post = real_post
     print("self-check ok")
 
 
