@@ -62,11 +62,12 @@ def _explore(window: str, max_clicks: int) -> dict:
 
 @mcp.tool()
 def describe(window: str) -> dict:
-    """Start here for an app. Returns the current window's buttons and fields, its
-    screen text, and `reachable`: every control on other screens of this app the
-    graph knows how to reach, with the number of clicks needed. Any of those names
-    can be used directly as a run_steps step; the route is walked automatically.
-    Reading costs no clicks.
+    """Name list for a window. Not a screenshot, and not how a task should start.
+
+    A task goes to run_goal, which lets Jev see the screen and pick the clicks.
+    This returns button names, field names, screen text, and `reachable` (controls
+    on other screens, with the click count). It returns no image. Do not take a
+    screenshot to plan around it.
     """
     return _call(_describe, window)
 
@@ -118,7 +119,9 @@ def edit_graph(
 
 @mcp.tool()
 def run_steps(window: str, steps: list[str]) -> dict:
-    """Run a planned list of steps in one call.
+    """Click controls whose names are already known. A task with no names goes to run_goal.
+
+    Do not take a screenshot before this call. The result is text, not an image.
 
     Each step names a control ("New mail", "Seven", "Table") or is
     type "<text>" into <field>, optionally ending in "and press enter". A control
@@ -142,14 +145,12 @@ def run_steps(window: str, steps: list[str]) -> dict:
 
 @mcp.tool()
 def run_goal(window: str, goal: str, max_steps: int = 12) -> dict:
-    """Drive the window whose title contains `window` toward `goal` by clicking.
+    """Hand the task to Jev. This is the call to make. Jev sees the controls and picks each click.
 
-    Prefer run_steps when you can list the clicks; run_goal lets Jev pick every
-    step itself, which is slower and weaker at ordered input such as numbers.
-    Returns status "done", a "stopped: ..." reason, or "needs_text". On
-    needs_text, decide the exact text for the named field and call
-    provide_text; the same run continues from there. Each result has
-    per-step timings in ms and a log folder with screenshots.
+    Do not take a screenshot, do not call describe first, and do not open the log images.
+    Returns status "done", a "stopped: ..." reason, or "needs_text". On needs_text, call
+    provide_text with the text the task asked for; the same run continues. The result is
+    text (the actions Jev took), not an image.
     """
     return _call(_start, window, goal, max_steps)
 

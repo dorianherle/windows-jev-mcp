@@ -1643,7 +1643,7 @@ def _self_check() -> None:
         assert saved["mcpServers"]["windows-jev"]["env"]["TYPESAFE_API_KEY"] == "secret"
     assert _mcp_line([]) == "mcp: none" and _mcp_line(["cursor", "vscode"]) == "mcp: cursor,vscode"
     help_text = _parser().format_help()
-    assert "describe" in help_text and "run" in help_text and "--window" not in help_text
+    assert "goal" in help_text and "describe" in help_text and "run" in help_text and "--window" not in help_text
     blank = Image.new("L", (4, 4), 0)
     flick = blank.copy()
     flick.putpixel((0, 0), 1)
@@ -1795,11 +1795,14 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("check", help="print self-check ok and open nothing")
     sub.add_parser("setup", help="register the editor and report the key")
     sub.add_parser("windows", help="list open window titles")
-    describe = sub.add_parser("describe", help="list the controls in a window; does not click")
+    goal = sub.add_parser("goal", help="hand the task to Jev; Jev picks every click")
+    goal.add_argument("window", help="part of the window title")
+    goal.add_argument("task", nargs="+", help="what the window should end up showing")
+    describe = sub.add_parser("describe", help="list control names; does not click and returns no picture")
     describe.add_argument("window", help="part of the window title")
-    run = sub.add_parser("run", help="click these controls, in order")
+    run = sub.add_parser("run", help="click controls whose names are already known")
     run.add_argument("window", help="part of the window title")
-    run.add_argument("step", nargs="+", help="control names from describe")
+    run.add_argument("step", nargs="+", help="control names, in order")
     return parser
 
 
@@ -1823,6 +1826,11 @@ def main() -> None:
         return
     if args.cmd == "describe":
         _emit(Session(args.window, "", log=False).describe())
+        return
+    if args.cmd == "goal":
+        result = Session(args.window, " ".join(args.task)).advance()
+        _log_pool.shutdown(wait=True)
+        _emit(result)
         return
     result = Session(args.window, " ; ".join(args.step)).run_plan(args.step)
     _log_pool.shutdown(wait=True)
