@@ -22,33 +22,15 @@ Install windows-jev on this Windows machine with uv. Do not open or click any ap
 - Open a new terminal if windows-jev is not found.
 - windows-jev check must print "self-check ok".
 - Ask me for a TypeSafe API key. Set the user environment variable TYPESAFE_API_KEY. Never print the key and never commit it.
-- If this editor has MCP, register the command windows-jev-mcp and tell me to reload. Cursor: ~/.cursor/mcp.json, key mcpServers. VS Code: user mcp.json, key servers, with "type": "stdio".
-- If this editor has no MCP, stop. The command windows-jev works in the terminal.
+- Run: windows-jev setup
+- Tell me to reload VS Code, open Copilot Chat, choose Agent, and allow the windows-jev tools.
 ```
 
 That is the whole install. Windows 10 or 11. A key from [typesafe.ai](https://typesafe.ai) is only used when a button name is not already on screen.
 
-Cursor, if it has MCP:
+`windows-jev setup` registers the server for GitHub Copilot. Copilot Chat in Agent mode can then call `describe` and `run_steps`. The same command also registers Cursor.
 
-```json
-{
-  "mcpServers": {
-    "windows-jev": { "command": "windows-jev-mcp" }
-  }
-}
-```
-
-VS Code, if it has MCP:
-
-```json
-{
-  "servers": {
-    "windows-jev": { "type": "stdio", "command": "windows-jev-mcp" }
-  }
-}
-```
-
-No MCP, same tool, from the terminal. Calculator has to be open:
+The terminal still works when chat is not in Agent mode. Calculator has to be open:
 
 ```text
 windows-jev describe Calculator

@@ -1630,6 +1630,16 @@ def _self_check() -> None:
     assert lookup("Evaporation", "click", [evap, {**entry, "text": "Spin coat resist coating"}])["text"] == evap["text"]
     assert lookup("Al", "click", [{**entry, "text": "AlGaAs"}, {**entry, "text": "AlN"}]) is None
     assert lookup("Evaporation", "click", [evap, {**evap, "text": "Evaporation of gold"}]) is None
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as root:
+        cfg = Path(root) / "mcp.json"
+        cfg.write_text('{"mcpServers": {"other": {"command": "keep"}}}', encoding="utf-8")
+        register_mcp(cfg, "mcpServers", "windows-jev-mcp", "secret")
+        register_mcp(cfg, "mcpServers", "windows-jev-mcp", "other-secret")
+        saved = json.loads(cfg.read_text(encoding="utf-8"))
+        assert saved["mcpServers"]["other"]["command"] == "keep"
+        assert saved["mcpServers"]["windows-jev"]["env"]["TYPESAFE_API_KEY"] == "secret"
     blank = Image.new("L", (4, 4), 0)
     flick = blank.copy()
     flick.putpixel((0, 0), 1)
@@ -1672,6 +1682,86 @@ def _self_check() -> None:
     print("self-check ok")
 
 
+def _server_command() -> str:
+    """The installed MCP program. A full path, so VS Code finds it without a fresh PATH."""
+    import shutil
+
+    found = shutil.which("windows-jev-mcp")
+    if found:
+        return found
+    names = ("windows-jev-mcp.exe", "windows-jev-mcp")
+    roots = [
+        Path.home() / ".local" / "bin",
+        Path(os.environ.get("APPDATA", "")) / "uv" / "bin",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "uv" / "bin",
+    ]
+    appdata = os.environ.get("APPDATA", "")
+    if appdata:
+        roots.append(Path(appdata) / "uv" / "tools" / "windows-jev-mcp" / "Scripts")
+    for root in roots:
+        for name in names:
+            candidate = root / name
+            if candidate.is_file():
+                return str(candidate)
+    return "windows-jev-mcp"
+
+
+def _key_or_blank() -> str:
+    try:
+        return api_key()
+    except Exception:
+        return ""
+
+
+def register_mcp(path: Path, key_name: str, command: str, api: str = "") -> None:
+    """Add the windows-jev server to an editor config. Other servers are left in place."""
+    data: dict = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except json.JSONDecodeError:
+            data = {}
+    servers = data.get(key_name)
+    if not isinstance(servers, dict):
+        servers = {}
+    previous = servers.get("windows-jev")
+    env = dict(previous.get("env") or {}) if isinstance(previous, dict) else {}
+    if api and "TYPESAFE_API_KEY" not in env:
+        env["TYPESAFE_API_KEY"] = api
+    entry: dict = {"command": command}
+    if key_name == "servers":
+        entry["type"] = "stdio"
+    if env:
+        entry["env"] = env
+    servers["windows-jev"] = entry
+    data[key_name] = servers
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def setup_editors() -> list[str]:
+    """Register the server for GitHub Copilot in VS Code, VS Code itself, and Cursor."""
+    command = _server_command()
+    api = _key_or_blank()
+    appdata = Path(os.environ.get("APPDATA", ""))
+    targets = [
+        (Path.home() / ".copilot" / "mcp-config.json", "mcpServers"),
+        (Path.home() / ".cursor" / "mcp.json", "mcpServers"),
+    ]
+    if appdata:
+        targets.append((appdata / "Code" / "User" / "mcp.json", "servers"))
+        insiders = appdata / "Code - Insiders" / "User"
+        if insiders.is_dir():
+            targets.append((insiders / "mcp.json", "servers"))
+    written = []
+    for path, key_name in targets:
+        register_mcp(path, key_name, command, api)
+        written.append(str(path))
+    return written
+
+
 def _emit(result: dict) -> None:
     sys.stdout.write(json.dumps(result, indent=2) + "\n")
     if str(result.get("status", "")).startswith("stopped"):
@@ -1685,6 +1775,11 @@ def main() -> None:
         _self_check()
         return
     cmd, rest = argv[0], argv[1:]
+    if cmd == "setup":
+        for path in setup_editors():
+            sys.stdout.write(path + "\n")
+        sys.stdout.write("Reload VS Code. In Copilot Chat, choose Agent, and allow windows-jev.\n")
+        return
     if cmd == "windows":
         sys.stdout.write("".join(title + "\n" for _hwnd, title in enum_windows()))
         return
