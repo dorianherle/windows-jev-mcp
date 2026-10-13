@@ -127,9 +127,15 @@ def run_steps(window: str, steps: list[str]) -> dict:
     needs to be named. Runs follow new windows the app opens and wait up to 3 s for
     known controls while a window opens. Every click grows the graph.
 
-    Grounding is exact name, then the graph, then one batched Jev call. Stops at the first step with no matching control; clicks that
-    changed nothing are flagged screen_changed=false. Returns per-step timings in ms
-    (with the route walked) and the final screen_text for verification.
+    Grounding is exact name, then the graph, then one batched Jev call that also sees
+    controls on other screens of the graph. A control still not found is searched for:
+    Jev picks a tab or menu to open (at most 2 clicks, never Send/Delete-like names).
+    Jev answers below confidence are ignored, so nothing is clicked on a guess. Enter waits
+    for the new page inside this call: put the steps that happen after a navigation in this
+    same list, instead of returning to plan them. Stops at the first step with no matching
+    control; clicks that changed nothing are flagged screen_changed=false. Returns per-step
+    timings in ms (with the route walked), the final screen_text, and the buttons and fields
+    now on screen. The window title is read again after the run.
     """
     return _call(_plan, window, steps)
 

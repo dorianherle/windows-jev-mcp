@@ -3,3 +3,4 @@ __pycache__/
 .venv/
 windows_jev_runs/
 .env
+chipcake_result.json
