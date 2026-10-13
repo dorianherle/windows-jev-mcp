@@ -33,14 +33,29 @@ That is the whole install. Windows 10 or 11. A key from [typesafe.ai](https://ty
 
 `windows-jev setup` registers the server for whichever editor is installed. When this chat has MCP, call `describe` and `run_steps`. Copilot Chat in VS Code needs Agent mode. Cursor uses the same tools.
 
-Without MCP, the terminal is the whole interface. Calculator has to be open:
+## Paste this to try it
+
+Calculator has to be open. This is the click-through in the clip above.
+
+```
+Click Calculator through 12 + 7 with windows-jev. Leave every other app alone.
+
+- If this chat can call the windows-jev tools, call describe on Calculator, then run_steps with One, Two, Plus, Seven, Equals.
+- If it cannot, run these and nothing else:
+  windows-jev describe Calculator
+  windows-jev run Calculator One Two Plus Seven Equals
+- Use the control names describe printed. Calculator names the keys One and Plus, not 1 and +.
+- Stop when the display is 19.
+```
+
+`describe` only looks. `run` and `run_steps` move the pointer. The result should say `Display is 19`.
+
+The same commands by hand:
 
 ```text
 windows-jev describe Calculator
 windows-jev run Calculator One Two Plus Seven Equals
 ```
-
-`describe` only looks. `run` moves the pointer. The result should say `Display is 19`. An editor with MCP calls the same thing as `describe` and `run_steps`.
 
 | | |
 |---|---|
